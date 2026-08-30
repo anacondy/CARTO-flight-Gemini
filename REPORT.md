@@ -311,6 +311,46 @@ session (no vision available), so the issue was diagnosed from evidence instead.
 
 ---
 
+## 11. Addendum — 2026-08-30 (evening): incident #3 — CARTO watermark + both data APIs unreachable from the owner's browser
+
+**Reported by the owner:** map now loads ✔, but: repeated *"API key required"* watermarks across
+the tiles, a 🇺🇦 flag in the CARTO attribution (bottom-right), *"RADAR CONNECTION INTERRUPTED.
+RECONNECTING"* in the HUD (no flights), and a diag run showing checks **1, 5, 6 failed**
+(1 = "script load error (file missing?)", 5 = OpenSky "Failed to fetch", 6 = adsb.lol "Failed to fetch").
+
+### Root causes found
+
+| Symptom | Root cause | Evidence |
+|---|---|---|
+| "API key required" watermark on tiles | **CARTO policy change (2026):** raster basemaps at `basemaps.cartocdn.com` now *require an API key*; keyless requests are served watermarked (the map still works — the watermark is a notice, not an outage). The raster service is being retired. The 🇺🇦 mark is CARTO's own attribution badge. | CARTO's own basemaps FAQ & terms; Home Assistant hit the identical issue (2026.08) |
+| No flight data; "connection interrupted" | Both live APIs unreachable from the owner's browser (network block and/or missing CORS headers). Server-side, both APIs were verified live the same hour. | Owner's diag run (checks 5 & 6 "Failed to fetch"); OpenSky has sent CORS headers since 2017 (maintainer-confirmed on StackOverflow); adsb.lol returned **no** `Access-Control-Allow-Origin` on a direct probe — browser CORS support unconfirmed |
+| diag check 1 "script load error" | **Bug in diag.html itself** (owned & fixed): its CSP `script-src 'unsafe-inline'` was missing `'self'`, so the page blocked its own probe of `vendor/leaflet/leaflet.js`. The map engine was never broken — which is exactly why the map rendered while check 1 "failed". | diag.html source; map worked in the owner's browser simultaneously |
+| Public CORS proxies as a rescue path | Tested and rejected for now: `api.allorigins.win` and `api.codetabs.com` both returned Cloudflare 522 (origin down) during this session — too unreliable to route live data through by default. | Direct probes this session |
+
+### Fixes applied (tests now **93/93**)
+
+| # | Fix | Detail |
+|---|---|---|
+| 1 | **Watermark-free default basemap** | Default is now **Esri World Dark Gray** (Base + Reference label overlay) — key-free, watermark-free, same dark aesthetic. The CARTO Dark Matter look remains available as an **opt-in**: request a free key (5M tiles/month fair use) and set `CONFIG.CARTO_KEY` in `index.html`. CARTO's terms forbid hiding their watermark, so keyless CARTO is no longer used. The OSM dark-tint auto-fallback now covers the Esri layer too. |
+| 2 | **Triple-source data fan-out** | Zoomed-in queries now try **adsb.fi** (`opendata.adsb.fi/api/v3/lat/…/lon/…/dist/…`, ≤250 NM, 1 req/s, ADSB-X schema — verified live today, e.g. `AIC101` / A350-900 `VT-JRA` over Delhi with 0.3 s-old fixes) → **adsb.lol** → **OpenSky bbox**. Whichever endpoint the user's browser can actually reach serves the data. Per-endpoint health tracking (`adsbfi`/`adsblol`/`opensky`), benched after 3 consecutive failures. |
+| 3 | **One normalizer for both community APIs** | `normalizeAdsb()` handles the shared ADSB-X schema (adsb.fi adds `desc`, used as the aircraft type when the short `t` code is absent). |
+| 4 | **diag.html v2** | CSP fixed (`script-src 'self'` — the check-1 false-fail); now 8 checks including Esri/OSM/CARTO tiles and all three data APIs; API checks now **distinguish "network blocked" from "reachable but CORS-blocked"** via a no-cors probe + CORS fetch comparison. |
+| 5 | **Attribution honesty** | Map attribution & HUD subtitle now credit Esri/OSM and all three data sources. |
+| 6 | **Tests 79 → 93** | New assertions: Esri basemap default + reference overlay wired; CARTO only used when `CARTO_KEY` set; CSP allows `opendata.adsb.fi` and `*.arcgisonline.com`; two ADSB sources in fan-out order; per-endpoint health keys; `refresh()` walks the candidate chain; URL builders for both community endpoints; adsb.fi `desc` fallback; diag.html CSP regression test. |
+
+### Honest outcome for the owner's network
+
+- The **map** is now watermark-free (Esri) with the same dark look.
+- **Flights will appear if the owner's browser can reach ANY of the three endpoints.** adsb.fi
+  (Cloudflare-fronted) is a different domain from both previously-failing APIs and is now first
+  in line.
+- If diag **still** shows all three APIs failing with "network unreachable" (rather than
+  "CORS-blocked"), the network itself is filtering those domains — no client-side code can fix
+  that; the options are a different network/VPN or self-hosting a tiny proxy. The revised diag
+  says which case it is.
+
+---
+
 ## Appendix — CI workflow file (commit manually)
 
 ```yaml

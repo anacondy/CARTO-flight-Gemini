@@ -24,10 +24,10 @@ Inspired by high-contrast, dark-mode data visualizations, this radar features a 
 
 ## ✨ Features
 
-- **Real-Time Dual-Source Tracking:** Live state vectors from two independent community ADS-B networks. Zoomed-in views refresh every **12 seconds** via adsb.lol; wider views use OpenSky with credit-budgeted viewport queries.
-- **Automatic Failover:** If one source is rate-limited, blocked, or down, the radar automatically falls back to the other (with runtime health tracking).
+- **Real-Time Triple-Source Tracking:** Live state vectors from three independent community ADS-B networks, tried in fan-out order (adsb.fi → adsb.lol → OpenSky). Zoomed-in views refresh every **12 seconds**; wider views use OpenSky with credit-budgeted viewport queries. If your network blocks one source, the next one serves you automatically.
+- **Automatic Failover:** Per-endpoint health tracking with automatic benching — the radar keeps working when a source is rate-limited, CORS-blocked, or down.
 - **Dead-Reckoning Interpolation:** Between API fixes, every aircraft is advanced along its true track at its reported ground speed — planes **glide continuously** instead of teleporting on every poll.
-- **Dark Matter Aesthetic:** Utilizes the CARTO Dark Matter basemap for a modern, sleek, and distraction-free experience.
+- **Dark, Watermark-Free Aesthetic:** Default basemap is Esri's key-free **World Dark Gray** canvas. (CARTO raster tiles now carry an *"API key required"* watermark for keyless use — set the free `CONFIG.CARTO_KEY` in `index.html` to restore the original Dark Matter look.)
 - **Smart Viewport Rendering:** Data is fetched **for the area you're looking at**, and HTML markers are only created for aircraft currently visible within your screen bounds (viewport culling), with a marker cap at world zoom to keep things smooth on phones.
 - **Interactive Tooltips & Popups:**
   - Zoom in (level 7+) to reveal permanent text callsigns floating above the aircraft.
@@ -48,8 +48,8 @@ This project is incredibly lightweight and requires **zero build tools**.
 |---|---|
 | Frontend | HTML5, CSS3, Vanilla JavaScript (ES6+) |
 | Mapping Engine | [Leaflet.js](https://leafletjs.com/) v1.9.4 — **self-hosted** under `vendor/leaflet/` (no CDN) |
-| Basemap | [CARTO Dark Matter](https://carto.com/basemaps/) with automatic dark-tinted [OpenStreetMap](https://www.openstreetmap.org) fallback |
-| Live Data | [OpenSky Network API](https://opensky-network.org/apidoc/) + [adsb.lol API](https://api.adsb.lol/docs) |
+| Basemap | [Esri World Dark Gray](https://server.arcgisonline.com/) (key-free) · [CARTO Dark Matter](https://carto.com/basemaps/) opt-in via free key · dark-tinted [OpenStreetMap](https://www.openstreetmap.org) auto-fallback |
+| Live Data | [adsb.fi](https://github.com/adsbfi/opendata) + [adsb.lol](https://api.adsb.lol/docs) + [OpenSky Network](https://opensky-network.org/apidoc/) — automatic fan-out |
 | Tests | Node.js (`node test/app.test.mjs` — no dependencies) |
 | Hosting | GitHub Pages (auto-deployed via GitHub Actions) |
 
@@ -103,12 +103,12 @@ The app is engineered around that budget:
 - HTTP 429 triggers exponential back-off (×2 up to ×8), and polling pauses in hidden tabs.
 - With dead reckoning filling the gaps, the radar still animates smoothly between fixes.
 
-### adsb.lol ([/v2/lat/…/lon/…/dist/…](https://api.adsb.lol/docs))
+### adsb.fi ([opendata.adsb.fi/api/v3](https://github.com/adsbfi/opendata)) & adsb.lol ([/v2](https://api.adsb.lol/docs))
 
 - No key, no credits, ~1 req/s etiquette — the app polls every 12 s.
-- Used automatically whenever the view radius is ≤ 250 nm (i.e. whenever you're actually
-  looking at a region), and as the fallback source when zoomed out.
-- Adds airframe details (registration, aircraft type) to the popup.
+- Tried **in fan-out order** whenever the view radius is ≤ 250 nm (i.e. whenever you're actually looking at a region), and as fallbacks when zoomed out.
+- Adds airframe details (registration, aircraft type/description) to the popup.
+- If one community API is unreachable or CORS-blocked on your network, the engine automatically tries the next one, then OpenSky — see [`diag.html`](diag.html) to check which endpoints your browser can reach.
 
 ---
 
