@@ -47,7 +47,7 @@ const lib = pureMatch
         ${pureMatch[1]}
         return { num, normLon, shortestAngle, haversineNm, deadReckon, predictPos,
                  estimateOpenSkyCredits, buildOpenSkyQuery, buildAdsbUrl,
-                 normalizeOpenSky, normalizeAdsbLol };
+                 normalizeOpenSky, normalizeAdsb, ADSB_SOURCES };
       `)()
     : null;
 
@@ -115,11 +115,23 @@ const qclamp = lib.buildOpenSkyQuery(-95, -10, 95, 10);
 ok(qclamp.url.includes('lamin=-85.0000') && qclamp.url.includes('lamax=85.0000'),
    'latitudes clamped to ±85 (Web-Mercator limit)');
 
-console.log('\n── adsb.lol URL builder ──');
-ok(lib.buildAdsbUrl(28.6, 77.1, 250) === 'https://api.adsb.lol/v2/lat/28.6000/lon/77.1000/dist/250',
-   'adsb.lol URL well-formed');
-ok(lib.buildAdsbUrl(0, 190, 300).includes('/lon/-170.0000/dist/250'),
-   'adsb.lol URL wraps lon and clamps radius to 250 nm');
+console.log('\n── community ADS-B URL builders (fan-out sources) ──');
+// [CHANGED 2026-08-30 — incident #3] two keyless ADSB-X endpoints are tried in
+// order, so a network that blocks one falls through to the other.
+eq(lib.ADSB_SOURCES.length, 2, 'two community ADS-B sources configured');
+ok(lib.ADSB_SOURCES[0].base === 'https://opendata.adsb.fi/api' &&
+   lib.ADSB_SOURCES[1].base === 'https://api.adsb.lol/v2',
+   'fan-out order: adsb.fi first, adsb.lol second');
+ok(lib.buildAdsbUrl(0, 28.6, 77.1, 250) ===
+   'https://opendata.adsb.fi/api/v3/lat/28.6000/lon/77.1000/dist/250',
+   'adsb.fi v3 URL well-formed');
+ok(lib.buildAdsbUrl(1, 28.6, 77.1, 250) ===
+   'https://api.adsb.lol/v2/lat/28.6000/lon/77.1000/dist/250',
+   'adsb.lol v2 URL well-formed');
+ok(lib.buildAdsbUrl(1, 0, 190, 300).includes('/lon/-170.0000/dist/250'),
+   'URL wraps lon and clamps radius to 250 nm');
+ok(lib.buildAdsbUrl(99, 10, 20, 100).startsWith('https://api.adsb.lol/v2/'),
+   'out-of-range source index clamps to the last entry');
 
 console.log('\n── OpenSky normalisation (live fixture, 2026-08-30) ──');
 // Real rows captured from GET /api/states/all?lamin=28&lomin=76&lamax=31&lomax=79
@@ -147,8 +159,9 @@ const baroOnly = [["abc123","TEST1  ","Testland",1788109590,1788109590,10,20,150
 approx(lib.normalizeOpenSky(baroOnly, NOW)[0].altM, 1500, 1e-6,
        'altitude falls back to barometric when geo is null');
 
-console.log('\n── adsb.lol normalisation (live fixture, 2026-08-30) ──');
-// Real rows captured from GET /v2/lat/28.6/lon/77.1/dist/50
+console.log('\n── community ADS-B normalisation (live fixtures, 2026-08-30) ──');
+// Real rows captured from the live APIs today: adsb.lol /v2 point query and
+// adsb.fi /v3 point query (identical ADSB-X schema).
 const adsbFixture = [
     { hex:"8013ed", flight:"AIC314  ", r:"VT-TVB", t:"A21N", alt_baro:11425, gs:358.6,
       track:119.21, lat:28.419937, lon:77.003913, seen_pos:0.65 },
@@ -157,10 +170,13 @@ const adsbFixture = [
     { hex:"deadbe", flight:"GROUND1 ", r:"N/A", t:"C172", alt_baro:"ground", gs:0,
       track:360, lat:28.5, lon:77.1, seen_pos:1 },                          // ground → dropped
     { hex:"cafe00", flight:"NOPOS   ", r:"", t:"", alt_baro:5000, gs:200,
-      track:10, lat:null, lon:null, seen_pos:2 }                            // no position → dropped
+      track:10, lat:null, lon:null, seen_pos:2 },                           // no position → dropped
+    // adsb.fi v3 row (richer: desc/ownOp) — captured from opendata.adsb.fi
+    { hex:"8015f7", flight:"AIC101  ", r:"VT-JRA", desc:"AIRBUS A-350-900",
+      alt_baro:9375, gs:375.5, track:213.27, lat:28.215179, lon:76.829453, seen_pos:0.306 }
 ];
-const adModels = lib.normalizeAdsbLol(adsbFixture, NOW);
-eq(adModels.length, 2, 'ground + positionless aircraft filtered out');
+const adModels = lib.normalizeAdsb(adsbFixture, NOW);
+eq(adModels.length, 3, 'ground + positionless aircraft filtered out');
 eq(adModels[0].id, '8013ed', 'id from hex');
 eq(adModels[0].callsign, 'AIC314', 'callsign trimmed');
 approx(adModels[0].altM, 11425 * 0.3048, 1e-3, 'altitude converted ft → m (mm precision)');
@@ -171,6 +187,8 @@ eq(adModels[0].actype, 'A21N', 'aircraft type preserved');
 eq(adModels[0].fixMs, NOW - 650, 'fixMs uses seen_pos age');
 approx(adModels[1].vel, 0, 1e-9, 'missing gs tolerated as 0 m/s');
 approx(adModels[1].track, 298, 1e-6, 'calc_track used when track missing');
+eq(adModels[2].actype, 'AIRBUS A-350-900',
+   'adsb.fi rows: desc used as type when t is missing');
 
 console.log('\n── wiring & security assertions ──');
 ok(html.includes('connect-src https://opensky-network.org https://api.adsb.lol'),
@@ -184,7 +202,7 @@ ok(!/setInterval\(\s*fetch/.test(scriptMatch ? scriptMatch[1] : ''),
 ok(scriptMatch && scriptMatch[1].includes('visibilitychange'),
    'pauses polling when the tab is hidden');
 
-console.log('\n── resilience (2026-08-30 incident #2: "map does not load") ──');
+console.log('\n── resilience (2026-08-30 incidents #2 & #3) ──');
 // Leaflet must be self-hosted: the unpkg CDN dependency made the whole map vanish
 // for users whose network cannot reach unpkg.com.
 ok(html.includes('src="vendor/leaflet/leaflet.js"'), 'Leaflet is self-hosted (vendor/)');
@@ -212,12 +230,40 @@ ok(scriptMatch && scriptMatch[1].includes("typeof L === 'undefined'"),
    'boot guard: visible HUD error if the map engine fails to load');
 ok(scriptMatch && scriptMatch[1].includes('tileerror') &&
    html.includes('tile.openstreetmap.org'),
-   'basemap fallback to OpenStreetMap on CARTO tile failure');
-ok(html.includes('img-src data: https://*.basemaps.cartocdn.com https://*.cartocdn.com https://tile.openstreetmap.org'),
-   'CSP img-src allows both basemap hosts');
+   'basemap fallback to OpenStreetMap on primary tile failure');
+ok(html.includes('img-src data: https://*.basemaps.cartocdn.com https://*.cartocdn.com https://tile.openstreetmap.org https://*.arcgisonline.com'),
+   'CSP img-src allows all three basemap hosts');
 ok(html.includes('.osm-dark-filter'), 'dark-mode CSS tint exists for fallback tiles');
 ok(html.includes('vendor/leaflet/leaflet.js') && html.split('https://unpkg.com').length === 1,
    'index.html has no remaining unpkg references (diag page excluded)');
+
+console.log('\n── incident #3: watermark-free basemap + source fan-out ──');
+// CARTO raster tiles now carry an "API key required" watermark for keyless use,
+// so the default basemap must be Esri's key-free World Dark Gray canvas.
+ok(html.includes('Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}'),
+   'default basemap is Esri World Dark Gray (no key, no watermark)');
+ok(html.includes('Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}'),
+   'Esri reference overlay (labels/borders) wired');
+ok(html.includes('CARTO_KEY') && html.includes("CARTO_KEY: ''"),
+   'CARTO Dark Matter remains available as opt-in via CONFIG.CARTO_KEY');
+ok(scriptMatch && scriptMatch[1].includes('if (CFG.CARTO_KEY)'),
+   'CARTO layer only used when a key is configured');
+// Data fan-out: three keyless endpoints, ordered, with per-endpoint health.
+ok(html.includes('connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi'),
+   'CSP connect-src allows all three live data sources');
+ok(scriptMatch && scriptMatch[1].includes("adsbfi: 0, adsblol: 0, opensky: 0"),
+   'per-endpoint health tracking for all three sources');
+ok(scriptMatch && scriptMatch[1].includes('plan.fallbacks'),
+   'refresh walks a multi-source candidate chain');
+// Regression: diag.html must permit loading the vendored script — its CSP once
+// forgot 'self' in script-src, making check 1 report a false failure.
+{
+    const diag = readFileSync(join(ROOT, 'diag.html'), 'utf8');
+    ok(/script-src[^;']*'self'/.test(diag),
+       "diag.html CSP allows 'self' scripts (check-1 false-fail regression)");
+    ok(diag.includes('opendata.adsb.fi'),
+       'diag.html tests the adsb.fi endpoint too');
+}
 
 console.log(`\n══ ${passed} passed, ${failed} failed ══`);
 process.exit(failed ? 1 : 0);
