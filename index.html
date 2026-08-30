@@ -12,15 +12,19 @@
          [CHANGED 2026-08-30] connect-src also allows the two community ADS-B APIs
          (api.adsb.lol, opendata.adsb.fi) as live data sources.
          [CHANGED 2026-08-30 — incident #3] img-src now allows *.arcgisonline.com —
-         CARTO raster tiles now carry an "API key required" watermark for keyless
-         use (CARTO policy change, 2026), so the default basemap switched to Esri's
-         key-free World Dark Gray canvas. CARTO remains available as an opt-in
-         (CONFIG.CARTO_KEY) for the original Dark Matter look. -->
+         the default basemap switched to Esri's key-free World Dark Gray canvas
+         (CARTO raster tiles are watermarked without a key).
+         [CHANGED 2026-08-30 — incident #4] connect-src now allows the public CORS
+         relays (corsproxy.io, allorigins, codetabs) used as an automatic LAST
+         resort: the owner's diag run proved all three flight APIs are reachable
+         but send no Access-Control-Allow-Origin, so browsers cannot read them
+         directly. Relays are only tried after direct attempts fail. If you
+         self-host extras/cloudflare-worker.js, add its host here too. -->
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'none';
                    style-src 'self' 'unsafe-inline';
                    script-src 'self' 'unsafe-inline';
-                   connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi;
+                   connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi https://corsproxy.io https://api.allorigins.win https://api.codetabs.com;
                    img-src data: https://*.basemaps.cartocdn.com https://*.cartocdn.com https://tile.openstreetmap.org https://*.arcgisonline.com;
                    font-src 'none';
                    frame-src 'none';
@@ -362,7 +366,24 @@
             // CARTO raster tiles are watermarked without a key (and the keyless
             // service is being retired). Free key: https://carto.com/basemaps/apikey
             // Leave empty ('') to use the default key-free Esri dark basemap.
-            CARTO_KEY: ''
+            CARTO_KEY: '',
+
+            // [ADDED 2026-08-30 — incident #4] CORS-relay tier. The owner's diag
+            // run proved all three flight APIs are REACHABLE but send no
+            // Access-Control-Allow-Origin header, so no browser can read them
+            // directly. After every direct attempt fails, the same query is
+            // retried through each of these read-only public relays in order
+            // (they add the missing CORS header). Only small payloads go through
+            // relays (community point queries and small OpenSky boxes — never
+            // multi-megabyte world queries). For production reliability, deploy
+            // your own relay in 2 minutes: see extras/cloudflare-worker.js and
+            // set PROXY_BASE below (plus its host in the CSP).
+            PROXY_TEMPLATES: [
+                'https://corsproxy.io/?url={url}',
+                'https://api.allorigins.win/raw?url={url}',
+                'https://api.codetabs.com/v1/proxy?quest={url}'
+            ],
+            PROXY_BASE: ''      // e.g. 'https://my-relay.workers.dev/?url=' (self-hosted)
         };
 
         // PURE-LOGIC-START
@@ -552,6 +573,14 @@
             return out;
         }
 
+        // Wrap an absolute API URL in a read-only CORS-relay template ('{url}'
+        // placeholder). Relays fetch server-side and re-serve the payload with
+        // the Access-Control-Allow-Origin header the flight APIs omit.
+        // [ADDED 2026-08-30 — incident #4]
+        function buildProxiedUrl(template, url) {
+            return template.replace('{url}', encodeURIComponent(url));
+        }
+
         // PURE-LOGIC-END
 
         // ── Map initialisation (unchanged from v1) ────────────────────────────
@@ -647,6 +676,24 @@
         // their browser — so the engine now fans out across every endpoint and
         // benches one only after repeated consecutive failures.
         const sourceFails = { adsbfi: 0, adsblol: 0, opensky: 0 };
+        // [ADDED 2026-08-30 — incident #4] health per CORS relay (parallel to
+        // CFG.PROXY_TEMPLATES / PROXY_BASE), plus a sticky "route that worked"
+        // so the winning source+relay combination is retried FIRST next poll.
+        const proxyFails = [0, 0, 0];
+        let bestRoute = null;         // { kind:'adsb'|'opensky', idx, proxyIdx }
+
+        function proxyTemplates() {
+            // A self-hosted relay (PROXY_BASE) always wins over public relays.
+            return CFG.PROXY_BASE ? [CFG.PROXY_BASE + '{url}'] : CFG.PROXY_TEMPLATES;
+        }
+        function proxyHealthy(i) {
+            return proxyFails[i] < CFG.SOURCE_FAIL_THRESHOLD;
+        }
+        function healthyProxyIndices() {
+            const out = [];
+            proxyTemplates().forEach((_, i) => { if (proxyHealthy(i)) out.push(i); });
+            return out;
+        }
 
         const PLANE_SVG_PATH =
             'M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z';
@@ -824,11 +871,22 @@
             return idx;
         }
 
-        function adsbCandidate(srcIdx, lat, lon, dist) {
+        function adsbCandidate(srcIdx, lat, lon, dist, proxyIdx) {
+            const direct = buildAdsbUrl(srcIdx, lat, lon, dist);
             return {
-                source: 'adsb', adsbIdx: srcIdx,
-                url: buildAdsbUrl(srcIdx, lat, lon, dist),
+                source: 'adsb', adsbIdx: srcIdx, proxyIdx: proxyIdx ?? null,
+                url: proxyIdx == null ? direct
+                   : buildProxiedUrl(proxyTemplates()[proxyIdx], direct),
                 credits: 0, healthKey: ADSB_SOURCES[srcIdx].healthKey
+            };
+        }
+
+        function openskyCandidate(url, credits, proxyIdx) {
+            return {
+                source: 'opensky', adsbIdx: null, proxyIdx: proxyIdx ?? null,
+                url: proxyIdx == null ? url
+                   : buildProxiedUrl(proxyTemplates()[proxyIdx], url),
+                credits, healthKey: 'opensky'
             };
         }
 
@@ -843,37 +901,99 @@
                 haversineNm(c.lat, c.lng, sw.lat, sw.lng)
             );
 
-            const adsbIdxs = healthyAdsbIndices();
+            const adsbDirect = healthyAdsbIndices();       // usable without a relay
+            const adsbAll = ADSB_SOURCES.map((_, i) => i); // relay-eligible regardless
+            const proxies = healthyProxyIndices();
 
             // Zoomed in enough for a ≤250 NM point query to blanket the view?
-            // → 12 s refresh, richer airframe data, no credits. Try each
-            //   community API in turn, then OpenSky as the final fallback.
-            if (adsbIdxs.length > 0 && radiusNm <= CFG.ADSB_MAX_RADIUS_NM) {
+            // → 12 s refresh, richer airframe data, no credits. Candidates are
+            //   built in buildCandidateList(): direct → via relay → OpenSky.
+            if (adsbAll.length > 0 && radiusNm <= CFG.ADSB_MAX_RADIUS_NM &&
+                (adsbDirect.length > 0 || proxies.length > 0)) {
                 const dist = Math.ceil(radiusNm * 1.2);             // small margin
                 const dLat = dist / 60;                             // 1° lat = 60 nm
                 const dLon = dLat / Math.max(Math.cos(c.lat * DEG), 0.05);
                 const fb = buildOpenSkyQuery(c.lat - dLat, c.lng - dLon,
                                              c.lat + dLat, c.lng + dLon);
                 return {
-                    key: `adsb:${adsbIdxs.join(',')}:${c.lat.toFixed(1)}:${c.lng.toFixed(1)}:${dist}`,
-                    primary: adsbCandidate(adsbIdxs[0], c.lat, c.lng, dist),
-                    fallbacks: [
-                        ...adsbIdxs.slice(1).map(i => adsbCandidate(i, c.lat, c.lng, dist)),
-                        { source: 'opensky', url: fb.url, credits: fb.credits, healthKey: 'opensky' }
-                    ]
+                    kind: 'adsb',
+                    key: `adsb:${c.lat.toFixed(1)}:${c.lng.toFixed(1)}:${dist}`,
+                    credits: 0, dist, center: { lat: c.lat, lng: c.lng },
+                    adsbDirect, adsbAll, proxies,
+                    openskyUrl: fb.url, openskyCredits: fb.credits
                 };
             }
 
-            // Zoomed out (or both community APIs benched) → OpenSky viewport
-            // query.  [FIX] v1 always requested the whole planet (4 credits a pop).
+            // Zoomed out (or every community API+relay benched) → OpenSky
+            // viewport query.  [FIX] v1 always requested the whole planet.
             const q = buildOpenSkyQuery(b.getSouth(), b.getWest(), b.getNorth(), b.getEast());
             return {
+                kind: 'opensky',
                 key: `opensky:${q.area.toFixed(0)}`,
-                primary: { source: 'opensky', url: q.url, credits: q.credits, healthKey: 'opensky' },
-                fallbacks: adsbIdxs.length > 0
-                    ? [adsbCandidate(adsbIdxs[0], c.lat, c.lng, CFG.ADSB_MAX_RADIUS_NM)]
-                    : []
+                credits: q.credits, center: { lat: c.lat, lng: c.lng },
+                adsbDirect, adsbAll, proxies,
+                openskyUrl: q.url, openskyCredits: q.credits
             };
+        }
+
+        // Build the ordered fetch chain for a plan:
+        //   sticky route → direct sources → sources via each relay → OpenSky
+        //   direct → OpenSky via relay (small boxes only — never push
+        //   multi-megabyte world queries through free public relays).
+        // [ADDED 2026-08-30 — incident #4]
+        function buildCandidateList(plan) {
+            const list = [];
+            const seen = new Set();
+            const push = cand => {
+                const k = `${cand.source}:${cand.adsbIdx}:${cand.proxyIdx}`;
+                if (seen.has(k)) return;
+                seen.add(k);
+                list.push(cand);
+            };
+
+            // 1) Sticky route first: the exact source+relay combo that worked last
+            //    time, so healthy networks pay zero relay-probing latency.
+            if (bestRoute) {
+                const r = bestRoute;
+                if (r.kind === 'adsb' && plan.kind === 'adsb') {
+                    const ok = r.proxyIdx == null
+                        ? sourceHealthy(ADSB_SOURCES[r.idx].healthKey)
+                        : proxyHealthy(r.proxyIdx);
+                    if (ok) push(adsbCandidate(r.idx, plan.center.lat,
+                                               plan.center.lng, plan.dist, r.proxyIdx));
+                } else if (r.kind === 'opensky') {
+                    const ok = r.proxyIdx == null
+                        ? sourceHealthy('opensky')
+                        : (proxyHealthy(r.proxyIdx) && plan.credits <= 2);
+                    if (ok) push(openskyCandidate(plan.openskyUrl, plan.credits, r.proxyIdx));
+                }
+            }
+
+            // 2) Direct community sources (health-filtered).
+            if (plan.kind === 'adsb') {
+                for (const i of plan.adsbDirect) {
+                    push(adsbCandidate(i, plan.center.lat, plan.center.lng, plan.dist, null));
+                }
+                // 3) Same sources through each relay. Note: a source benched for
+                //    DIRECT failures (CORS!) is still worth trying via a relay.
+                for (const p of plan.proxies) {
+                    for (const i of plan.adsbAll) {
+                        push(adsbCandidate(i, plan.center.lat, plan.center.lng, plan.dist, p));
+                    }
+                }
+            }
+
+            // 4) OpenSky direct, then 5) OpenSky via relay for small boxes only.
+            if (sourceHealthy('opensky')) {
+                push(openskyCandidate(plan.openskyUrl, plan.openskyCredits, null));
+            }
+            if (plan.openskyCredits <= 2) {
+                for (const p of plan.proxies) {
+                    push(openskyCandidate(plan.openskyUrl, plan.openskyCredits, p));
+                }
+            }
+
+            return list;
         }
 
         // ── Data fetching ──────────────────────────────────────────────────────
@@ -936,9 +1056,9 @@
 
         function scheduleNextPoll(plan) {
             clearTimeout(pollTimer);
-            const base = plan.primary.source === 'adsb' ? CFG.ADSB_POLL_MS
-                        : (plan.primary.credits >= 3 ? CFG.OPENSKY_POLL_GLOBAL_MS
-                                                     : CFG.OPENSKY_POLL_MS);
+            const base = plan.kind === 'adsb' ? CFG.ADSB_POLL_MS
+                        : (plan.credits >= 3 ? CFG.OPENSKY_POLL_GLOBAL_MS
+                                             : CFG.OPENSKY_POLL_MS);
             pollTimer = setTimeout(refresh, base * backoff);
         }
 
@@ -949,38 +1069,54 @@
 
             const plan = planQuery();
             lastPlanKey = plan.key;
-            lastPlanCredits = plan.primary.credits || 4;
+            lastPlanCredits = plan.credits || 4;
 
             let models = null;
+            let servedBy = null;
             let rateLimited = false;
 
-            // [CHANGED 2026-08-30 — incident #3] walk the whole candidate chain:
-            // primary → every fallback. Whichever endpoint the user's browser can
-            // actually reach (network + CORS) serves the data; the rest are
-            // health-tracked and benched after repeated failures.
-            const candidates = [plan.primary, ...plan.fallbacks];
-            for (const cand of candidates) {
+            // [CHANGED 2026-08-30 — incidents #3 & #4] walk the full candidate
+            // chain: sticky route → direct sources → sources via CORS relays →
+            // OpenSky (direct, then small-boxes via relay). Whichever route the
+            // user's browser can actually traverse serves the data; failures are
+            // health-tracked per source AND per relay, with the winning route
+            // remembered (bestRoute) so it is retried first next poll.
+            const chain = buildCandidateList(plan);
+            for (const cand of chain) {
                 if (models) break;
                 try {
                     models = await fetchModels(cand);
+                    servedBy = cand;
                     sourceFails[cand.healthKey] = 0;
+                    if (cand.proxyIdx != null) proxyFails[cand.proxyIdx] = 0;
                 } catch (err) {
                     if (err.rateLimited) rateLimited = true;
                     sourceFails[cand.healthKey]++;
-                    console.warn('[FlightRadar] source failed:',
-                                 cand.healthKey, err.message);
+                    if (cand.proxyIdx != null) proxyFails[cand.proxyIdx]++;
+                    console.warn('[FlightRadar] route failed:',
+                                 cand.healthKey,
+                                 cand.proxyIdx != null ? 'via relay #' + cand.proxyIdx : 'direct',
+                                 err.message);
                 }
             }
 
             try {
                 if (models) {
-                    activeSource = models.length ? models[0].source : plan.primary.source;
+                    // Remember the winning route for the next poll.
+                    bestRoute = servedBy.source === 'adsb'
+                        ? { kind: 'adsb', idx: servedBy.adsbIdx, proxyIdx: servedBy.proxyIdx }
+                        : { kind: 'opensky', idx: null, proxyIdx: servedBy.proxyIdx };
+
+                    activeSource = models.length ? models[0].source : servedBy.source;
                     applyFixes(models);
                     backoff = 1;                       // healthy again → normal cadence
                     const noun = activeSource === 'adsb' ? 'airborne flights'
                                                        : 'global airborne flights';
+                    // Honest HUD: append a note when data arrives via a CORS
+                    // relay (public relays add latency & are best-effort).
+                    const viaRelay = servedBy.proxyIdx != null ? ' · via CORS relay' : '';
                     statusEl.textContent =
-                        `Tracking ${flights.size.toLocaleString()} ${noun}`;
+                        `Tracking ${flights.size.toLocaleString()} ${noun}${viaRelay}`;
                     statusEl.style.color = '#ccc';
                 } else if (rateLimited) {
                     // Same "holding pattern" UX as v1, but now with back-off so we

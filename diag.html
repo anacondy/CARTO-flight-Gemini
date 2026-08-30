@@ -21,7 +21,7 @@
           content="default-src 'none';
                    style-src 'unsafe-inline';
                    script-src 'unsafe-inline' 'self';
-                   connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi https://unpkg.com;
+                   connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi https://unpkg.com https://corsproxy.io https://api.allorigins.win https://api.codetabs.com;
                    img-src https://*.basemaps.cartocdn.com https://server.arcgisonline.com https://tile.openstreetmap.org data:;">
     <style>
         body { margin:0; padding:24px; background:#050505; color:#eee;
@@ -46,9 +46,9 @@
 <body>
     <h1>Radar Diagnostics</h1>
     <p>Testing every dependency the flight radar needs, from your browser. A ✘ row =
-       that service is blocked/unreachable for you. If an API row says <i>"reachable but
-       CORS-blocked"</i>, the app will automatically use another source (or you need a
-       network without the block). Share this table if you report an issue.</p>
+       that service is blocked/unreachable for you. If API rows say <i>"reachable but
+       CORS-blocked"</i>, direct browser access is impossible — the app then retries
+       through the CORS relays (rows 9–11). If any relay row passes, flights appear. Share this table if you report an issue.</p>
 
     <table>
         <thead><tr><th>Check</th><th>Target</th><th style="width:90px">Result</th><th style="width:80px">Time</th><th>Detail</th></tr></thead>
@@ -60,7 +60,7 @@
         'use strict';
         const rows = document.getElementById('rows');
         const results = [];
-        const TOTAL = 8;
+        const TOTAL = 11;
 
         function row(name, target) {
             const tr = document.createElement('tr');
@@ -172,6 +172,20 @@
         checkApi('8 · OpenSky API (live data, zoomed-out)',
                  'https://opensky-network.org/api/states/all?lamin=28&lomin=76&lamax=31&lomax=79',
                  d => Array.isArray(d.states), d => d.states.length + ' aircraft (Delhi box)');
+
+        // 9–11 — CORS-relay routes: the app retries the SAME live data through
+        // these relays when direct requests are CORS-blocked (added 2026-08-30,
+        // incident #4). If any of these passes, flights WILL appear on the map.
+        const ADSBFI = 'https://opendata.adsb.fi/api/v3/lat/28.6/lon/77.1/dist/30';
+        checkApi('9 · adsb.fi via corsproxy.io relay',
+                 'https://corsproxy.io/?url=' + encodeURIComponent(ADSBFI),
+                 d => Array.isArray(d.ac), d => d.ac.length + ' aircraft — relay works!');
+        checkApi('10 · adsb.fi via allorigins relay',
+                 'https://api.allorigins.win/raw?url=' + encodeURIComponent(ADSBFI),
+                 d => Array.isArray(d.ac), d => d.ac.length + ' aircraft — relay works!');
+        checkApi('11 · adsb.fi via codetabs relay',
+                 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(ADSBFI),
+                 d => Array.isArray(d.ac), d => d.ac.length + ' aircraft — relay works!');
     </script>
 </body>
 </html>
