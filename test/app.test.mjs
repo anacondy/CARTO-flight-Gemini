@@ -47,7 +47,7 @@ const lib = pureMatch
         ${pureMatch[1]}
         return { num, normLon, shortestAngle, haversineNm, deadReckon, predictPos,
                  estimateOpenSkyCredits, buildOpenSkyQuery, buildAdsbUrl,
-                 normalizeOpenSky, normalizeAdsb, ADSB_SOURCES };
+                 buildProxiedUrl, normalizeOpenSky, normalizeAdsb, ADSB_SOURCES };
       `)()
     : null;
 
@@ -249,12 +249,12 @@ ok(html.includes('CARTO_KEY') && html.includes("CARTO_KEY: ''"),
 ok(scriptMatch && scriptMatch[1].includes('if (CFG.CARTO_KEY)'),
    'CARTO layer only used when a key is configured');
 // Data fan-out: three keyless endpoints, ordered, with per-endpoint health.
-ok(html.includes('connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi'),
-   'CSP connect-src allows all three live data sources');
+ok(html.includes('connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi https://corsproxy.io https://api.allorigins.win https://api.codetabs.com'),
+   'CSP connect-src allows all three live data sources + the three CORS relays');
 ok(scriptMatch && scriptMatch[1].includes("adsbfi: 0, adsblol: 0, opensky: 0"),
    'per-endpoint health tracking for all three sources');
-ok(scriptMatch && scriptMatch[1].includes('plan.fallbacks'),
-   'refresh walks a multi-source candidate chain');
+ok(scriptMatch && scriptMatch[1].includes('buildCandidateList(plan)'),
+   'refresh walks a multi-route candidate chain (direct + relays)');
 // Regression: diag.html must permit loading the vendored script — its CSP once
 // forgot 'self' in script-src, making check 1 report a false failure.
 {
@@ -265,5 +265,33 @@ ok(scriptMatch && scriptMatch[1].includes('plan.fallbacks'),
        'diag.html tests the adsb.fi endpoint too');
 }
 
-console.log(`\n══ ${passed} passed, ${failed} failed ══`);
+console.log('\n── incident #4: CORS-relay tier ──');
+// All three flight APIs are reachable but send no Access-Control-Allow-Origin,
+// so the engine retries each source through read-only CORS relays.
+ok(lib.buildProxiedUrl('https://r.example/?url={url}', 'https://api.adsb.lol/v2/x') ===
+   'https://r.example/?url=' + encodeURIComponent('https://api.adsb.lol/v2/x'),
+   'buildProxiedUrl percent-encodes the inner API URL');
+ok(html.includes('https://corsproxy.io/?url={url}') &&
+   html.includes('https://api.allorigins.win/raw?url={url}') &&
+   html.includes('https://api.codetabs.com/v1/proxy?quest={url}'),
+   'three public relay templates configured');
+ok(html.includes("PROXY_BASE: ''"),
+   'self-hosted relay override (PROXY_BASE) present, default off');
+ok(scriptMatch && scriptMatch[1].includes('proxyFails') &&
+   scriptMatch[1].includes('bestRoute'),
+   'per-relay health tracking + sticky winning route');
+ok(scriptMatch && scriptMatch[1].includes('plan.openskyCredits <= 2'),
+   'OpenSky goes through relays for small boxes only (never world queries)');
+{
+    const exists = p => { try { readFileSync(join(ROOT, p)); return true; } catch { return false; } };
+    ok(exists('extras/cloudflare-worker.js'), 'self-hostable Cloudflare Worker relay provided');
+    const worker = readFileSync(join(ROOT, 'extras/cloudflare-worker.js'), 'utf8');
+    ok(worker.includes("'access-control-allow-origin': '*'") &&
+       worker.includes('ALLOWED_HOSTS'), 'worker sends CORS headers + allow-lists the APIs');
+    const diag = readFileSync(join(ROOT, 'diag.html'), 'utf8');
+    ok(diag.includes('corsproxy.io') && diag.includes('allorigins') && diag.includes('codetabs'),
+       'diag.html tests all three relay routes from the user\'s browser');
+}
+
+console.log(`\n\u2550\u2550 ${passed} passed, ${failed} failed \u2550\u2550`);
 process.exit(failed ? 1 : 0);
