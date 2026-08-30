@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Radar Diagnostics — which dependency is blocked?</title>
+    <!--
+      diag.html — connectivity self-test for the Live Flight Radar (added 2026-08-30).
+
+      Opens every external dependency the radar needs, directly from YOUR browser,
+      and reports pass/fail with timing. Use it when the map or flight data does
+      not appear: whatever row shows ✘ is what your network/browser is blocking.
+
+      This page is deliberately dependency-free (all inline, no CDN) so it can
+      diagnose the very outages it tests for.
+    -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'none';
+                   style-src 'unsafe-inline';
+                   script-src 'unsafe-inline';
+                   connect-src https://opensky-network.org https://api.adsb.lol https://unpkg.com;
+                   img-src https://*.basemaps.cartocdn.com https://tile.openstreetmap.org data:;">
+    <style>
+        body { margin:0; padding:24px; background:#050505; color:#eee;
+               font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+        h1 { font-size:16px; letter-spacing:2px; text-transform:uppercase; }
+        p  { color:#888; font-size:12px; }
+        table { border-collapse:collapse; width:100%; max-width:860px;
+                background:rgba(20,20,20,.85); border:1px solid rgba(255,255,255,.15);
+                border-radius:10px; overflow:hidden; }
+        th, td { text-align:left; padding:10px 14px; font-size:13px;
+                 border-bottom:1px solid rgba(255,255,255,.08); }
+        th { color:#aaa; text-transform:uppercase; font-size:10px; letter-spacing:1px; }
+        td.status { font-weight:700; white-space:nowrap; }
+        .ok   { color:#4caf50; }
+        .fail { color:#ff4444; }
+        .wait { color:#ffaa00; }
+        code { color:#8fd3ff; font-size:12px; word-break:break-all; }
+        #summary { margin-top:16px; font-size:14px; font-weight:600; }
+    </style>
+</head>
+<body>
+    <h1>Radar Diagnostics</h1>
+    <p>Testing every dependency the flight radar needs, from your browser. A ✘ row = that
+       service is blocked/unreachable for you. Share this table if you report an issue.</p>
+
+    <table>
+        <thead><tr><th>Check</th><th>Target</th><th style="width:90px">Result</th><th style="width:110px">Time</th><th>Detail</th></tr></thead>
+        <tbody id="rows"></tbody>
+    </table>
+    <div id="summary" class="wait">Running…</div>
+
+    <script>
+        'use strict';
+        const rows = document.getElementById('rows');
+        const results = [];
+
+        function row(name, target) {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${name}</td><td><code>${target}</code></td>` +
+                           `<td class="status wait">…</td><td class="t">–</td><td class="d">–</td>`;
+            rows.appendChild(tr);
+            return {
+                done(ok, ms, detail) {
+                    results.push(ok);
+                    tr.querySelector('.status').textContent = ok ? '✔ OK' : '✘ FAIL';
+                    tr.querySelector('.status').className = 'status ' + (ok ? 'ok' : 'fail');
+                    tr.querySelector('.t').textContent = ms + ' ms';
+                    tr.querySelector('.d').textContent = detail || '';
+                    finishMaybe();
+                }
+            };
+        }
+
+        function finishMaybe() {
+            const el = document.getElementById('summary');
+            if (results.length < 6) return;
+            const bad = results.filter(r => !r).length;
+            el.className = bad ? 'fail' : 'ok';
+            el.textContent = bad
+                ? `✘ ${bad} of 6 checks FAILED — the ✘ rows are what your network is blocking.`
+                : '✔ All 6 checks passed — the radar should fully work in this browser.';
+        }
+
+        // 1 — Map engine (self-hosted): does the vendored Leaflet load and register?
+        {
+            const r = row('1 · Map engine (self-hosted)', 'vendor/leaflet/leaflet.js');
+            const t0 = performance.now();
+            const s = document.createElement('script');
+            s.src = 'vendor/leaflet/leaflet.js';
+            s.onload = () => r.done(typeof L !== 'undefined' && L.version === '1.9.4',
+                                    Math.round(performance.now() - t0),
+                                    'Leaflet ' + (window.L ? L.version : 'not defined'));
+            s.onerror = () => r.done(false, Math.round(performance.now() - t0),
+                                     'script load error (file missing?)');
+            document.head.appendChild(s);
+        }
+
+        // 2 — Old CDN: was the previous dependency (unpkg) the reason the map died?
+        {
+            const r = row('2 · unpkg.com (old dependency, now unused)', 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js');
+            const t0 = performance.now();
+            fetch('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', { mode: 'no-cors', cache: 'no-store' })
+                .then(() => r.done(true, Math.round(performance.now() - t0), 'reachable'))
+                .catch(e => r.done(false, Math.round(performance.now() - t0), e.message));
+        }
+
+        // 3 — CARTO Dark Matter tile (primary basemap)
+        {
+            const r = row('3 · CARTO dark basemap tile', 'https://a.basemaps.cartocdn.com/dark_all/4/6/5.png');
+            const t0 = performance.now();
+            const img = new Image();
+            const timeout = setTimeout(() => r.done(false, Math.round(performance.now() - t0), 'timeout (10 s)'), 10000);
+            img.onload = () => { clearTimeout(timeout); r.done(img.naturalWidth > 0, Math.round(performance.now() - t0), img.naturalWidth + '×' + img.naturalHeight); };
+            img.onerror = () => { clearTimeout(timeout); r.done(false, Math.round(performance.now() - t0), 'image blocked/errored'); };
+            img.src = 'https://a.basemaps.cartocdn.com/dark_all/4/6/5.png';
+        }
+
+        // 4 — OpenStreetMap tile (basemap fallback)
+        {
+            const r = row('4 · OpenStreetMap fallback tile', 'https://tile.openstreetmap.org/4/6/5.png');
+            const t0 = performance.now();
+            const img = new Image();
+            const timeout = setTimeout(() => r.done(false, Math.round(performance.now() - t0), 'timeout (10 s)'), 10000);
+            img.onload = () => { clearTimeout(timeout); r.done(img.naturalWidth > 0, Math.round(performance.now() - t0), img.naturalWidth + '×' + img.naturalHeight); };
+            img.onerror = () => { clearTimeout(timeout); r.done(false, Math.round(performance.now() - t0), 'image blocked/errored'); };
+            img.src = 'https://tile.openstreetmap.org/4/6/5.png';
+        }
+
+        // 5 — OpenSky live API (global/zoomed-out data source)
+        {
+            const r = row('5 · OpenSky API (live data)', 'https://opensky-network.org/api/states/all?lamin=28&lomin=76&lamax=31&lomax=79');
+            const t0 = performance.now();
+            fetch('https://opensky-network.org/api/states/all?lamin=28&lomin=76&lamax=31&lomax=79', { cache: 'no-store' })
+                .then(res => res.json()
+                    .then(d => r.done(Array.isArray(d.states), Math.round(performance.now() - t0),
+                                      d.states ? d.states.length + ' aircraft (Delhi box)' : 'no states array')))
+                .catch(e => r.done(false, Math.round(performance.now() - t0), e.message));
+        }
+
+        // 6 — adsb.lol live API (zoomed-in data source)
+        {
+            const r = row('6 · adsb.lol API (live data)', 'https://api.adsb.lol/v2/lat/28.6/lon/77.1/dist/100');
+            const t0 = performance.now();
+            fetch('https://api.adsb.lol/v2/lat/28.6/lon/77.1/dist/100', { cache: 'no-store' })
+                .then(res => res.json()
+                    .then(d => r.done(Array.isArray(d.ac), Math.round(performance.now() - t0),
+                                      d.ac ? d.ac.length + ' aircraft (Delhi area)' : 'no ac array')))
+                .catch(e => r.done(false, Math.round(performance.now() - t0), e.message));
+        }
+    </script>
+</body>
+</html>

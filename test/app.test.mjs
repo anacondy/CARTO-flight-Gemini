@@ -175,10 +175,6 @@ approx(adModels[1].track, 298, 1e-6, 'calc_track used when track missing');
 console.log('\n── wiring & security assertions ──');
 ok(html.includes('connect-src https://opensky-network.org https://api.adsb.lol'),
    'CSP connect-src allows both live data sources');
-ok(html.includes("https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"),
-   'Leaflet pinned to 1.9.4');
-ok(/integrity="sha256-[^"]+"/.test(html) && html.split('integrity=').length >= 3,
-   'SRI integrity hashes present on CDN assets');
 ok(html.includes("L.map('map'"), 'map initialised on #map');
 ok(html.includes('basemaps.cartocdn.com/dark_all'), 'CARTO Dark Matter tiles wired');
 ok(html.includes("id=\"status\""), 'status HUD element present');
@@ -187,6 +183,41 @@ ok(!/setInterval\(\s*fetch/.test(scriptMatch ? scriptMatch[1] : ''),
    'fetch loop is self-scheduling (no blind setInterval → no overlapping requests)');
 ok(scriptMatch && scriptMatch[1].includes('visibilitychange'),
    'pauses polling when the tab is hidden');
+
+console.log('\n── resilience (2026-08-30 incident #2: "map does not load") ──');
+// Leaflet must be self-hosted: the unpkg CDN dependency made the whole map vanish
+// for users whose network cannot reach unpkg.com.
+ok(html.includes('src="vendor/leaflet/leaflet.js"'), 'Leaflet is self-hosted (vendor/)');
+ok(!html.includes('unpkg.com/leaflet'), 'no unpkg Leaflet dependency remains');
+ok(html.includes('href="vendor/leaflet/leaflet.css"'), 'Leaflet CSS self-hosted (vendor/)');
+{
+    const exists = p => { try { readFileSync(join(ROOT, p)); return true; } catch { return false; } };
+    ok(exists('vendor/leaflet/leaflet.js') && exists('vendor/leaflet/leaflet.css') &&
+       exists('vendor/leaflet/LICENSE'), 'vendored Leaflet files exist (incl. BSD LICENSE)');
+    // The SRI hash in the HTML must match the actual vendored file — proves the
+    // file wasn't corrupted and protects against future tampering.
+    const crypto = await import('node:crypto');
+    const sri = f => 'sha256-' + crypto.createHash('sha256')
+        .update(readFileSync(join(ROOT, f))).digest('base64');
+    const jsAttr = html.match(/src="vendor\/leaflet\/leaflet\.js"\s+integrity="([^"]+)"/);
+    const cssAttr = html.match(/href="vendor\/leaflet\/leaflet\.css"\s+integrity="([^"]+)"/);
+    ok(!!jsAttr && jsAttr[1] === sri('vendor/leaflet/leaflet.js'),
+       'SRI hash in HTML matches vendored leaflet.js');
+    ok(!!cssAttr && cssAttr[1] === sri('vendor/leaflet/leaflet.css'),
+       'SRI hash in HTML matches vendored leaflet.css');
+    ok(sri('vendor/leaflet/leaflet.css') === 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=',
+       'vendored CSS is byte-identical to the official Leaflet 1.9.4 CDN build');
+}
+ok(scriptMatch && scriptMatch[1].includes("typeof L === 'undefined'"),
+   'boot guard: visible HUD error if the map engine fails to load');
+ok(scriptMatch && scriptMatch[1].includes('tileerror') &&
+   html.includes('tile.openstreetmap.org'),
+   'basemap fallback to OpenStreetMap on CARTO tile failure');
+ok(html.includes('img-src data: https://*.basemaps.cartocdn.com https://*.cartocdn.com https://tile.openstreetmap.org'),
+   'CSP img-src allows both basemap hosts');
+ok(html.includes('.osm-dark-filter'), 'dark-mode CSS tint exists for fallback tiles');
+ok(html.includes('vendor/leaflet/leaflet.js') && html.split('https://unpkg.com').length === 1,
+   'index.html has no remaining unpkg references (diag page excluded)');
 
 console.log(`\n══ ${passed} passed, ${failed} failed ══`);
 process.exit(failed ? 1 : 0);
