@@ -5,27 +5,30 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Radar Diagnostics — which dependency is blocked?</title>
     <!--
-      diag.html — connectivity self-test for the Live Flight Radar (added 2026-08-30).
-
-      Opens every external dependency the radar needs, directly from YOUR browser,
-      and reports pass/fail with timing. Use it when the map or flight data does
-      not appear: whatever row shows ✘ is what your network/browser is blocking.
-
-      This page is deliberately dependency-free (all inline, no CDN) so it can
-      diagnose the very outages it tests for.
+      diag.html — connectivity self-test for the Live Flight Radar.
+      Added 2026-08-30; revised the same day (incident #3):
+        • FIX: script-src now includes 'self' — the original CSP forgot it, so
+          check 1 blocked its own vendored Leaflet load and reported a FALSE
+          failure ("script load error") even though the map engine was fine.
+        • Now tests all THREE live data endpoints (adsb.fi, adsb.lol, OpenSky)
+          and both basemap hosts (Esri primary, OSM fallback) + CARTO (legacy).
+        • API checks now distinguish "network blocked" from "CORS blocked": a
+          no-cors probe (opaque) still succeeds if the host is reachable, so
+          probe-ok + fetch-fail ⇒ the API is reachable but does not send CORS
+          headers to browsers.
     -->
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'none';
                    style-src 'unsafe-inline';
-                   script-src 'unsafe-inline';
-                   connect-src https://opensky-network.org https://api.adsb.lol https://unpkg.com;
-                   img-src https://*.basemaps.cartocdn.com https://tile.openstreetmap.org data:;">
+                   script-src 'unsafe-inline' 'self';
+                   connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi https://unpkg.com;
+                   img-src https://*.basemaps.cartocdn.com https://server.arcgisonline.com https://tile.openstreetmap.org data:;">
     <style>
         body { margin:0; padding:24px; background:#050505; color:#eee;
                font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
         h1 { font-size:16px; letter-spacing:2px; text-transform:uppercase; }
-        p  { color:#888; font-size:12px; }
-        table { border-collapse:collapse; width:100%; max-width:860px;
+        p  { color:#888; font-size:12px; max-width:860px; }
+        table { border-collapse:collapse; width:100%; max-width:920px;
                 background:rgba(20,20,20,.85); border:1px solid rgba(255,255,255,.15);
                 border-radius:10px; overflow:hidden; }
         th, td { text-align:left; padding:10px 14px; font-size:13px;
@@ -34,6 +37,7 @@
         td.status { font-weight:700; white-space:nowrap; }
         .ok   { color:#4caf50; }
         .fail { color:#ff4444; }
+        .warn { color:#ffaa00; }
         .wait { color:#ffaa00; }
         code { color:#8fd3ff; font-size:12px; word-break:break-all; }
         #summary { margin-top:16px; font-size:14px; font-weight:600; }
@@ -41,11 +45,13 @@
 </head>
 <body>
     <h1>Radar Diagnostics</h1>
-    <p>Testing every dependency the flight radar needs, from your browser. A ✘ row = that
-       service is blocked/unreachable for you. Share this table if you report an issue.</p>
+    <p>Testing every dependency the flight radar needs, from your browser. A ✘ row =
+       that service is blocked/unreachable for you. If an API row says <i>"reachable but
+       CORS-blocked"</i>, the app will automatically use another source (or you need a
+       network without the block). Share this table if you report an issue.</p>
 
     <table>
-        <thead><tr><th>Check</th><th>Target</th><th style="width:90px">Result</th><th style="width:110px">Time</th><th>Detail</th></tr></thead>
+        <thead><tr><th>Check</th><th>Target</th><th style="width:90px">Result</th><th style="width:80px">Time</th><th>Detail</th></tr></thead>
         <tbody id="rows"></tbody>
     </table>
     <div id="summary" class="wait">Running…</div>
@@ -54,6 +60,7 @@
         'use strict';
         const rows = document.getElementById('rows');
         const results = [];
+        const TOTAL = 8;
 
         function row(name, target) {
             const tr = document.createElement('tr');
@@ -61,10 +68,10 @@
                            `<td class="status wait">…</td><td class="t">–</td><td class="d">–</td>`;
             rows.appendChild(tr);
             return {
-                done(ok, ms, detail) {
+                done(ok, ms, detail, cls) {
                     results.push(ok);
                     tr.querySelector('.status').textContent = ok ? '✔ OK' : '✘ FAIL';
-                    tr.querySelector('.status').className = 'status ' + (ok ? 'ok' : 'fail');
+                    tr.querySelector('.status').className = 'status ' + (cls || (ok ? 'ok' : 'fail'));
                     tr.querySelector('.t').textContent = ms + ' ms';
                     tr.querySelector('.d').textContent = detail || '';
                     finishMaybe();
@@ -74,15 +81,55 @@
 
         function finishMaybe() {
             const el = document.getElementById('summary');
-            if (results.length < 6) return;
+            if (results.length < TOTAL) return;
             const bad = results.filter(r => !r).length;
             el.className = bad ? 'fail' : 'ok';
             el.textContent = bad
-                ? `✘ ${bad} of 6 checks FAILED — the ✘ rows are what your network is blocking.`
-                : '✔ All 6 checks passed — the radar should fully work in this browser.';
+                ? `✘ ${bad} of ${TOTAL} checks FAILED — the ✘ rows are what your network is blocking.`
+                : `✔ All ${TOTAL} checks passed — the radar should fully work in this browser.`;
         }
 
-        // 1 — Map engine (self-hosted): does the vendored Leaflet load and register?
+        // ── Image/tile check helper ──────────────────────────────────────────
+        function checkImage(name, url, note) {
+            const r = row(name, url.replace(/\/\d+\/\d+\/\d+[^/]*$/, '/z/x/y'));
+            const t0 = performance.now();
+            const img = new Image();
+            const timeout = setTimeout(
+                () => r.done(false, Math.round(performance.now() - t0), 'timeout (10 s)'), 10000);
+            img.onload = () => { clearTimeout(timeout);
+                r.done(img.naturalWidth > 0, Math.round(performance.now() - t0),
+                       (img.naturalWidth + '×' + img.naturalHeight) + (note ? ' · ' + note : '')); };
+            img.onerror = () => { clearTimeout(timeout);
+                r.done(false, Math.round(performance.now() - t0), 'image blocked/errored' + (note ? ' · ' + note : '')); };
+            img.src = url;
+        }
+
+        // ── API check helper: distinguishes network-block vs CORS-block ───────
+        // Step 1: opaque no-cors probe — resolves iff the host is reachable.
+        // Step 2: normal CORS fetch — fails if the API sends no ACAO header.
+        async function checkApi(name, url, shape, describe) {
+            const r = row(name, url.split('?')[0]);
+            const t0 = performance.now();
+            let reachable = false;
+            try {
+                await fetch(url, { mode: 'no-cors', cache: 'no-store' });
+                reachable = true;
+            } catch { reachable = false; }
+            try {
+                const res = await fetch(url, { cache: 'no-store' });
+                const data = await res.json();
+                const good = shape(data);
+                r.done(good, Math.round(performance.now() - t0),
+                      good ? describe(data) : 'unexpected payload (no aircraft array)');
+            } catch (e) {
+                r.done(false, Math.round(performance.now() - t0),
+                      reachable ? 'reachable but CORS-blocked (no Access-Control-Allow-Origin)'
+                                : 'network unreachable / blocked (' + e.message + ')');
+            }
+        }
+
+        // 1 — Map engine (self-hosted). [FIX] CSP now allows 'self' scripts, so
+        //     this is a true test (the old page blocked its own check).
         {
             const r = row('1 · Map engine (self-hosted)', 'vendor/leaflet/leaflet.js');
             const t0 = performance.now();
@@ -96,58 +143,35 @@
             document.head.appendChild(s);
         }
 
-        // 2 — Old CDN: was the previous dependency (unpkg) the reason the map died?
+        // 2 — unpkg.com (the OLD dependency — kept to explain past failures)
         {
             const r = row('2 · unpkg.com (old dependency, now unused)', 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js');
             const t0 = performance.now();
             fetch('https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', { mode: 'no-cors', cache: 'no-store' })
-                .then(() => r.done(true, Math.round(performance.now() - t0), 'reachable'))
-                .catch(e => r.done(false, Math.round(performance.now() - t0), e.message));
+                .then(() => r.done(true, Math.round(performance.now() - t0), 'reachable (not needed anymore)'))
+                .catch(e => r.done(false, Math.round(performance.now() - t0), e.message, 'warn'));
         }
 
-        // 3 — CARTO Dark Matter tile (primary basemap)
-        {
-            const r = row('3 · CARTO dark basemap tile', 'https://a.basemaps.cartocdn.com/dark_all/4/6/5.png');
-            const t0 = performance.now();
-            const img = new Image();
-            const timeout = setTimeout(() => r.done(false, Math.round(performance.now() - t0), 'timeout (10 s)'), 10000);
-            img.onload = () => { clearTimeout(timeout); r.done(img.naturalWidth > 0, Math.round(performance.now() - t0), img.naturalWidth + '×' + img.naturalHeight); };
-            img.onerror = () => { clearTimeout(timeout); r.done(false, Math.round(performance.now() - t0), 'image blocked/errored'); };
-            img.src = 'https://a.basemaps.cartocdn.com/dark_all/4/6/5.png';
-        }
+        // 3–5 — basemap hosts: Esri (primary), OSM (fallback), CARTO (legacy)
+        checkImage('3 · Esri dark basemap tile (primary)',
+                   'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/4/6/5',
+                   'key-free, no watermark');
+        checkImage('4 · OpenStreetMap tile (fallback)',
+                   'https://tile.openstreetmap.org/4/6/5.png');
+        checkImage('5 · CARTO dark tile (legacy — watermarked without key)',
+                   'https://a.basemaps.cartocdn.com/dark_all/4/6/5.png',
+                   'CARTO now requires an API key; expect a watermark');
 
-        // 4 — OpenStreetMap tile (basemap fallback)
-        {
-            const r = row('4 · OpenStreetMap fallback tile', 'https://tile.openstreetmap.org/4/6/5.png');
-            const t0 = performance.now();
-            const img = new Image();
-            const timeout = setTimeout(() => r.done(false, Math.round(performance.now() - t0), 'timeout (10 s)'), 10000);
-            img.onload = () => { clearTimeout(timeout); r.done(img.naturalWidth > 0, Math.round(performance.now() - t0), img.naturalWidth + '×' + img.naturalHeight); };
-            img.onerror = () => { clearTimeout(timeout); r.done(false, Math.round(performance.now() - t0), 'image blocked/errored'); };
-            img.src = 'https://tile.openstreetmap.org/4/6/5.png';
-        }
-
-        // 5 — OpenSky live API (global/zoomed-out data source)
-        {
-            const r = row('5 · OpenSky API (live data)', 'https://opensky-network.org/api/states/all?lamin=28&lomin=76&lamax=31&lomax=79');
-            const t0 = performance.now();
-            fetch('https://opensky-network.org/api/states/all?lamin=28&lomin=76&lamax=31&lomax=79', { cache: 'no-store' })
-                .then(res => res.json()
-                    .then(d => r.done(Array.isArray(d.states), Math.round(performance.now() - t0),
-                                      d.states ? d.states.length + ' aircraft (Delhi box)' : 'no states array')))
-                .catch(e => r.done(false, Math.round(performance.now() - t0), e.message));
-        }
-
-        // 6 — adsb.lol live API (zoomed-in data source)
-        {
-            const r = row('6 · adsb.lol API (live data)', 'https://api.adsb.lol/v2/lat/28.6/lon/77.1/dist/100');
-            const t0 = performance.now();
-            fetch('https://api.adsb.lol/v2/lat/28.6/lon/77.1/dist/100', { cache: 'no-store' })
-                .then(res => res.json()
-                    .then(d => r.done(Array.isArray(d.ac), Math.round(performance.now() - t0),
-                                      d.ac ? d.ac.length + ' aircraft (Delhi area)' : 'no ac array')))
-                .catch(e => r.done(false, Math.round(performance.now() - t0), e.message));
-        }
+        // 6–8 — live data endpoints, tried in fan-out order by the app
+        checkApi('6 · adsb.fi API (live data, 1st choice)',
+                 'https://opendata.adsb.fi/api/v3/lat/28.6/lon/77.1/dist/100',
+                 d => Array.isArray(d.ac), d => d.ac.length + ' aircraft (Delhi area)');
+        checkApi('7 · adsb.lol API (live data, 2nd choice)',
+                 'https://api.adsb.lol/v2/lat/28.6/lon/77.1/dist/100',
+                 d => Array.isArray(d.ac), d => d.ac.length + ' aircraft (Delhi area)');
+        checkApi('8 · OpenSky API (live data, zoomed-out)',
+                 'https://opensky-network.org/api/states/all?lamin=28&lomin=76&lamax=31&lomax=79',
+                 d => Array.isArray(d.states), d => d.states.length + ' aircraft (Delhi box)');
     </script>
 </body>
 </html>

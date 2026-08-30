@@ -9,19 +9,19 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black">
 
     <!-- Content Security Policy — restrict to only what the page needs.
-         [CHANGED 2026-08-30] connect-src also allows https://api.adsb.lol (secondary
-         live ADS-B source) and img-src allows tile.openstreetmap.org (basemap
-         fallback when the CARTO CDN is unreachable).
-         [CHANGED 2026-08-30 — incident #2] unpkg.com removed entirely: Leaflet is
-         now self-hosted under vendor/leaflet/, so no third-party code origin is
-         needed. This removes the "map does not load at all" failure mode where a
-         browser/network cannot reach unpkg.com (reported on some ISPs). -->
+         [CHANGED 2026-08-30] connect-src also allows the two community ADS-B APIs
+         (api.adsb.lol, opendata.adsb.fi) as live data sources.
+         [CHANGED 2026-08-30 — incident #3] img-src now allows *.arcgisonline.com —
+         CARTO raster tiles now carry an "API key required" watermark for keyless
+         use (CARTO policy change, 2026), so the default basemap switched to Esri's
+         key-free World Dark Gray canvas. CARTO remains available as an opt-in
+         (CONFIG.CARTO_KEY) for the original Dark Matter look. -->
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'none';
                    style-src 'self' 'unsafe-inline';
                    script-src 'self' 'unsafe-inline';
-                   connect-src https://opensky-network.org https://api.adsb.lol;
-                   img-src data: https://*.basemaps.cartocdn.com https://*.cartocdn.com https://tile.openstreetmap.org;
+                   connect-src https://opensky-network.org https://api.adsb.lol https://opendata.adsb.fi;
+                   img-src data: https://*.basemaps.cartocdn.com https://*.cartocdn.com https://tile.openstreetmap.org https://*.arcgisonline.com;
                    font-src 'none';
                    frame-src 'none';
                    base-uri 'self';
@@ -279,8 +279,8 @@
             <div class="pulse-dot" aria-hidden="true"></div>
             <h1>Live Global Airspace</h1>
         </div>
-        <!-- [CHANGED 2026-08-30] subtitle now credits both live data sources honestly -->
-        <p class="subtitle">Sources: OpenSky Network &middot; adsb.lol (Real-Time)</p>
+        <!-- [CHANGED 2026-08-30] subtitle credits all live data sources honestly -->
+        <p class="subtitle">Sources: OpenSky Network &middot; adsb.fi &middot; adsb.lol (Real-Time)</p>
         <p class="subtitle" id="status">Establishing radar connection…</p>
     </div>
 
@@ -315,12 +315,16 @@
            "Radar congested" until UTC midnight.
 
            WHAT CHANGED (same UI, new methodology):
-             • Dual live sources with automatic health-based fallback:
-                 - adsb.lol  (free community ADS-B API, no key, ≤1 req/s etiquette)
-                              used when the view radius ≤ 250 nm  → 12 s refresh
+             • Live sources with automatic health-based fan-out (2026-08-30):
+                 - adsb.fi   (opendata.adsb.fi/api, ADSB-X schema, ≤250 NM,
+                              1 req/s etiquette) tried first when zoomed in
+                 - adsb.lol  (api.adsb.lol/v2, same schema) tried second
                  - OpenSky   (anonymous, credit-budgeted) used when zoomed out,
                               queried with the *viewport bounding box* (1–4 credits
                               depending on area) on credit-aware intervals
+               Whichever endpoint the user's browser can actually reach serves the
+               data — a network that blocks/CORS-blocks one simply falls through
+               to the next. 12 s refresh when zoomed in via the community APIs.
              • Dead-reckoning interpolation: each aircraft is advanced along its
                true track at its reported ground speed between API fixes, so
                planes glide continuously instead of teleporting every poll.
@@ -352,7 +356,13 @@
             MARKER_CAP_MAX_ZOOM: 5,       // only apply the cap at zoom ≤ 5 (world views)
 
             VIEW_FETCH_DEBOUNCE_MS: 1500, // let the user finish panning before refetching
-            SOURCE_FAIL_THRESHOLD: 3      // consecutive failures before a source is benched
+            SOURCE_FAIL_THRESHOLD: 3,     // consecutive failures before a source is benched
+
+            // [ADDED 2026-08-30 — incident #3] optional CARTO Dark Matter key.
+            // CARTO raster tiles are watermarked without a key (and the keyless
+            // service is being retired). Free key: https://carto.com/basemaps/apikey
+            // Leave empty ('') to use the default key-free Esri dark basemap.
+            CARTO_KEY: ''
         };
 
         // PURE-LOGIC-START
@@ -365,8 +375,20 @@
         const MS_PER_KT = 0.514444;       // knots → metres/second
         const FT_PER_M = 3.28084;         // metres → feet (popup display only)
 
-        // Live data-source base URLs (single source of truth for the app AND tests)
-        const ADSB_URL_BASE = 'https://api.adsb.lol/v2';
+        // Live data-source base URLs (single source of truth for the app AND tests).
+        // [CHANGED 2026-08-30 — incident #3] the zoomed-in "point query" family now
+        // fans out across TWO community ADS-B APIs (both ADSB-X-compatible schema):
+        //   1. adsb.fi  — opendata.adsb.fi/api, /v3/lat/…/lon/…/dist/… (≤250 NM,
+        //                 1 req/s, richest airframe data incl. descriptions)
+        //   2. adsb.lol — api.adsb.lol/v2, /lat/…/lon/…/dist/…   (≤250 NM)
+        // Whichever the user's browser can actually reach serves the data; the
+        // engine tries them in order, then falls back to OpenSky.
+        const ADSB_SOURCES = [
+            { healthKey: 'adsbfi', base: 'https://opendata.adsb.fi/api',
+              path: (lat, lon, d) => `/v3/lat/${lat}/lon/${lon}/dist/${d}` },
+            { healthKey: 'adsblol', base: 'https://api.adsb.lol/v2',
+              path: (lat, lon, d) => `/lat/${lat}/lon/${lon}/dist/${d}` }
+        ];
         const OPENSKY_URL_BASE = 'https://opensky-network.org/api/states/all';
 
         // Coerce "maybe a number" API fields; returns null instead of NaN.
@@ -451,10 +473,13 @@
             };
         }
 
-        // adsb.lol point query: aircraft within `distNm` of (lat, lon).
-        function buildAdsbUrl(lat, lon, distNm) {
+        // Community ADS-B point query: aircraft within `distNm` of (lat, lon).
+        // [CHANGED 2026-08-30] source-indexed so the engine can try adsb.fi (0)
+        // and adsb.lol (1) in turn — both speak the ADSB-X schema.
+        function buildAdsbUrl(srcIdx, lat, lon, distNm) {
+            const s = ADSB_SOURCES[Math.max(0, Math.min(ADSB_SOURCES.length - 1, srcIdx))];
             const d = Math.max(1, Math.min(250, Math.round(distNm)));
-            return `${ADSB_URL_BASE}/lat/${(+lat).toFixed(4)}/lon/${normLon(lon).toFixed(4)}/dist/${d}`;
+            return s.base + s.path((+lat).toFixed(4), normLon(lon).toFixed(4), d);
         }
 
         /* Normalised aircraft model shared by both sources:
@@ -493,9 +518,10 @@
             return out;
         }
 
-        // adsb.lol v2 `/lat/…/lon/…/dist/…` `ac` array → models.
+        // Community ADS-B (ADSB-X-compatible) `ac` array → models. Works for both
+        // adsb.fi v3 and adsb.lol v2 — identical field shapes.
         // alt_baro is feet, gs is knots, seen_pos is seconds since last position.
-        function normalizeAdsbLol(acList, nowMs) {
+        function normalizeAdsb(acList, nowMs) {
             const out = [];
             if (!Array.isArray(acList)) return out;
             for (const a of acList) {
@@ -516,7 +542,9 @@
                     vel: gsKt === null ? 0 : gsKt * MS_PER_KT,      // kt → m/s
                     altM: altFt === null ? null : altFt / FT_PER_M, // ft → m
                     reg: a.r ? String(a.r) : null,
-                    actype: a.t ? String(a.t) : null,
+                    // adsb.fi additionally serves `desc` ("AIRBUS A-350-900")
+                    actype: (a.t ? String(a.t) : null) ||
+                            (a.desc ? String(a.desc) : null),
                     fixMs: nowMs - ageSec * 1000,
                     source: 'adsb'
                 });
@@ -535,24 +563,48 @@
 
         L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-        const darkTileLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-            // [CHANGED 2026-08-30] attribution credits both live data sources
-            attribution: '&copy; <a href="https://carto.com/" rel="noopener noreferrer">CARTO</a> &middot; data: <a href="https://opensky-network.org" rel="noopener noreferrer">OpenSky Network</a> &amp; <a href="https://adsb.lol" rel="noopener noreferrer">adsb.lol</a>',
-            subdomains: 'abcd',
-            maxZoom: 20,
-            // Pre-fetch neighbouring tiles to remove pop-in during panning
-            keepBuffer: 4,
-            updateWhenIdle: false,
-            updateWhenZooming: false
-        }).addTo(map);
+        /* ── Basemap selection ────────────────────────────────────────────────
+           [CHANGED 2026-08-30 — incident #3] CARTO began watermarking keyless
+           raster tiles ("API key required") and is retiring that service, so the
+           DEFAULT basemap is now Esri's key-free World Dark Gray canvas (same
+           dark aesthetic, no watermark, no key). To restore the original CARTO
+           Dark Matter look, request a free key at https://carto.com/basemaps/apikey
+           (fair use: 5M tiles/month) and set CONFIG.CARTO_KEY below. */
+        const DATA_ATTR = 'data: <a href="https://opensky-network.org" rel="noopener noreferrer">OpenSky Network</a> &amp; <a href="https://adsb.fi" rel="noopener noreferrer">adsb.fi</a>/<a href="https://adsb.lol" rel="noopener noreferrer">adsb.lol</a>';
+
+        let darkTileLayer;       // primary base layer (CARTO keyed OR Esri dark gray)
+        let darkRefLayer = null; // Esri reference overlay (labels/borders), if used
+
+        if (CFG.CARTO_KEY) {
+            // Opt-in: original CARTO Dark Matter with the owner's free API key.
+            darkTileLayer = L.tileLayer(
+                `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png?key=${encodeURIComponent(CFG.CARTO_KEY)}`, {
+                attribution: '&copy; <a href="https://carto.com/" rel="noopener noreferrer">CARTO</a> &copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener noreferrer">OpenStreetMap</a> contributors &middot; ' + DATA_ATTR,
+                subdomains: 'abcd', maxZoom: 20,
+                keepBuffer: 4, updateWhenIdle: false, updateWhenZooming: false
+            }).addTo(map);
+        } else {
+            // Default: Esri World Dark Gray canvas — key-free, watermark-free.
+            darkTileLayer = L.tileLayer(
+                'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+                attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, &copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener noreferrer">OpenStreetMap</a> contributors &middot; ' + DATA_ATTR,
+                maxNativeZoom: 16, maxZoom: 20,
+                keepBuffer: 4, updateWhenIdle: false, updateWhenZooming: false
+            }).addTo(map);
+            // Reference overlay adds place labels & borders on top of the base.
+            darkRefLayer = L.tileLayer(
+                'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}', {
+                attribution: '', maxNativeZoom: 16, maxZoom: 20, opacity: 0.85
+            }).addTo(map);
+        }
 
         // ── Basemap resilience ────────────────────────────────────────────────
-        // [ADDED 2026-08-30 — incident #2] if the CARTO CDN is unreachable from
-        // the user's network, every tile errors and the map appears "not loading
-        // at all". After repeated tile errors with ZERO successes, swap to
-        // OpenStreetMap tiles tinted dark via CSS (keeps the visual style) so the
-        // radar keeps working anywhere. Partial errors (a few missing tiles at
-        // extreme zoom) are normal and never trigger the switch.
+        // [ADDED 2026-08-30 — incident #2] if the primary basemap CDN is
+        // unreachable from the user's network, every tile errors and the map
+        // appears "not loading at all". After repeated tile errors with ZERO
+        // successes, swap to OpenStreetMap tiles tinted dark via CSS (keeps the
+        // visual style) so the radar keeps working anywhere. Partial errors (a
+        // few missing tiles) are normal and never trigger the switch.
         let tileErrors = 0, tileSuccesses = 0, tileWindowStart = Date.now();
         let usingFallbackTiles = false;
 
@@ -560,12 +612,13 @@
             if (usingFallbackTiles) return;
             usingFallbackTiles = true;
             map.removeLayer(darkTileLayer);
+            if (darkRefLayer) map.removeLayer(darkRefLayer);
             L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
                 maxZoom: 19,
                 className: 'osm-dark-filter',
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener noreferrer">OpenStreetMap</a> contributors &middot; data: <a href="https://opensky-network.org" rel="noopener noreferrer">OpenSky Network</a> &amp; <a href="https://adsb.lol" rel="noopener noreferrer">adsb.lol</a>'
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener noreferrer">OpenStreetMap</a> contributors &middot; ' + DATA_ATTR
             }).addTo(map);
-            statusEl.textContent = 'Dark basemap unreachable — using OSM fallback';
+            statusEl.textContent = 'Primary basemap unreachable — using OSM fallback';
             statusEl.style.color = '#ffaa00';
         }
 
@@ -589,7 +642,11 @@
         let lastPlanKey = '';          // identity of the last executed query
         let lastPlanCredits = 4;       // credit cost of that query (poll interval)
         let activeSource = null;       // source of the last successful dataset
-        const sourceFails = { adsb: 0, opensky: 0 }; // runtime source health
+        // [CHANGED 2026-08-30 — incident #3] per-endpoint health: adsbfi, adsblol,
+        // opensky. The user's diag run showed BOTH original APIs unreachable from
+        // their browser — so the engine now fans out across every endpoint and
+        // benches one only after repeated consecutive failures.
+        const sourceFails = { adsbfi: 0, adsblol: 0, opensky: 0 };
 
         const PLANE_SVG_PATH =
             'M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 3.5 1v-1.5L13 19v-5.5l8 2.5z';
@@ -753,9 +810,26 @@
             }
         }
 
-        // ── Query planning: pick the best source for the current view ─────────
-        function sourceHealthy(src) {
-            return sourceFails[src] < CFG.SOURCE_FAIL_THRESHOLD;
+        // ── Query planning: pick the best source chain for the current view ───
+        // [CHANGED 2026-08-30] adsb endpoints are an ordered fan-out list, so a
+        // network that cannot reach adsb.fi (or CORS-blocks it) automatically
+        // tries adsb.lol next, then OpenSky.
+        function sourceHealthy(key) {
+            return sourceFails[key] < CFG.SOURCE_FAIL_THRESHOLD;
+        }
+
+        function healthyAdsbIndices() {
+            const idx = [];
+            ADSB_SOURCES.forEach((s, i) => { if (sourceHealthy(s.healthKey)) idx.push(i); });
+            return idx;
+        }
+
+        function adsbCandidate(srcIdx, lat, lon, dist) {
+            return {
+                source: 'adsb', adsbIdx: srcIdx,
+                url: buildAdsbUrl(srcIdx, lat, lon, dist),
+                credits: 0, healthKey: ADSB_SOURCES[srcIdx].healthKey
+            };
         }
 
         function planQuery() {
@@ -769,30 +843,36 @@
                 haversineNm(c.lat, c.lng, sw.lat, sw.lng)
             );
 
-            // Zoomed in enough for adsb.lol's 250 nm point query to blanket the
-            // view? → unlimited-ish 12 s refresh, richer airframe data, no credits.
-            if (sourceHealthy('adsb') && radiusNm <= CFG.ADSB_MAX_RADIUS_NM) {
+            const adsbIdxs = healthyAdsbIndices();
+
+            // Zoomed in enough for a ≤250 NM point query to blanket the view?
+            // → 12 s refresh, richer airframe data, no credits. Try each
+            //   community API in turn, then OpenSky as the final fallback.
+            if (adsbIdxs.length > 0 && radiusNm <= CFG.ADSB_MAX_RADIUS_NM) {
                 const dist = Math.ceil(radiusNm * 1.2);             // small margin
                 const dLat = dist / 60;                             // 1° lat = 60 nm
                 const dLon = dLat / Math.max(Math.cos(c.lat * DEG), 0.05);
                 const fb = buildOpenSkyQuery(c.lat - dLat, c.lng - dLon,
                                              c.lat + dLat, c.lng + dLon);
                 return {
-                    key: `adsb:${c.lat.toFixed(1)}:${c.lng.toFixed(1)}:${dist}`,
-                    primary: { source: 'adsb', url: buildAdsbUrl(c.lat, c.lng, dist) },
-                    fallback: { source: 'opensky', url: fb.url, credits: fb.credits }
+                    key: `adsb:${adsbIdxs.join(',')}:${c.lat.toFixed(1)}:${c.lng.toFixed(1)}:${dist}`,
+                    primary: adsbCandidate(adsbIdxs[0], c.lat, c.lng, dist),
+                    fallbacks: [
+                        ...adsbIdxs.slice(1).map(i => adsbCandidate(i, c.lat, c.lng, dist)),
+                        { source: 'opensky', url: fb.url, credits: fb.credits, healthKey: 'opensky' }
+                    ]
                 };
             }
 
-            // Zoomed out (or adsb.lol benched) → OpenSky, queried for the viewport
-            // only.  [FIX] v1 always requested the whole planet (4 credits a pop).
+            // Zoomed out (or both community APIs benched) → OpenSky viewport
+            // query.  [FIX] v1 always requested the whole planet (4 credits a pop).
             const q = buildOpenSkyQuery(b.getSouth(), b.getWest(), b.getNorth(), b.getEast());
             return {
                 key: `opensky:${q.area.toFixed(0)}`,
-                primary: { source: 'opensky', url: q.url, credits: q.credits },
-                fallback: sourceHealthy('adsb')
-                    ? { source: 'adsb', url: buildAdsbUrl(c.lat, c.lng, CFG.ADSB_MAX_RADIUS_NM) }
-                    : null
+                primary: { source: 'opensky', url: q.url, credits: q.credits, healthKey: 'opensky' },
+                fallbacks: adsbIdxs.length > 0
+                    ? [adsbCandidate(adsbIdxs[0], c.lat, c.lng, CFG.ADSB_MAX_RADIUS_NM)]
+                    : []
             };
         }
 
@@ -806,8 +886,8 @@
             } catch { return undefined; }
         }
 
-        async function fetchModels(url, source) {
-            const response = await fetch(url, {
+        async function fetchModels(candidate) {
+            const response = await fetch(candidate.url, {
                 cache: 'no-store',
                 signal: timeoutSignal(CFG.FETCH_TIMEOUT_MS)
             });
@@ -820,12 +900,14 @@
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
             const data = await response.json();
-            const models = source === 'adsb'
-                ? normalizeAdsbLol(data && data.ac, Date.now())
+            // [CHANGED 2026-08-30] both community APIs share the ADSB-X schema,
+            // so one normalizer serves adsb.fi and adsb.lol alike.
+            const models = candidate.source === 'adsb'
+                ? normalizeAdsb(data && data.ac, Date.now())
                 : normalizeOpenSky(data && data.states, Date.now());
 
             if (models === null || models === undefined) {
-                throw new Error(`Unexpected API response from ${source}`);
+                throw new Error(`Unexpected API response from ${candidate.healthKey}`);
             }
             return models;
         }
@@ -854,9 +936,9 @@
 
         function scheduleNextPoll(plan) {
             clearTimeout(pollTimer);
-            const base = activeSource === 'adsb' ? CFG.ADSB_POLL_MS
-                        : (plan.credits >= 3 ? CFG.OPENSKY_POLL_GLOBAL_MS
-                                             : CFG.OPENSKY_POLL_MS);
+            const base = plan.primary.source === 'adsb' ? CFG.ADSB_POLL_MS
+                        : (plan.primary.credits >= 3 ? CFG.OPENSKY_POLL_GLOBAL_MS
+                                                     : CFG.OPENSKY_POLL_MS);
             pollTimer = setTimeout(refresh, base * backoff);
         }
 
@@ -872,31 +954,25 @@
             let models = null;
             let rateLimited = false;
 
-            try {
-                // 1) Try the planned primary source.
+            // [CHANGED 2026-08-30 — incident #3] walk the whole candidate chain:
+            // primary → every fallback. Whichever endpoint the user's browser can
+            // actually reach (network + CORS) serves the data; the rest are
+            // health-tracked and benched after repeated failures.
+            const candidates = [plan.primary, ...plan.fallbacks];
+            for (const cand of candidates) {
+                if (models) break;
                 try {
-                    models = await fetchModels(plan.primary.url, plan.primary.source);
-                    sourceFails[plan.primary.source] = 0;
-                } catch (primaryErr) {
-                    if (primaryErr.rateLimited) rateLimited = true;
-                    sourceFails[plan.primary.source]++;
-                    console.warn('[FlightRadar] primary source failed:',
-                                 plan.primary.source, primaryErr.message);
-
-                    // 2) Fall back to the other source (partial coverage beats none).
-                    if (plan.fallback && sourceHealthy(plan.fallback.source)) {
-                        try {
-                            models = await fetchModels(plan.fallback.url, plan.fallback.source);
-                            sourceFails[plan.fallback.source] = 0;
-                        } catch (fbErr) {
-                            if (fbErr.rateLimited) rateLimited = true;
-                            sourceFails[plan.fallback.source]++;
-                            console.warn('[FlightRadar] fallback source failed:',
-                                         plan.fallback.source, fbErr.message);
-                        }
-                    }
+                    models = await fetchModels(cand);
+                    sourceFails[cand.healthKey] = 0;
+                } catch (err) {
+                    if (err.rateLimited) rateLimited = true;
+                    sourceFails[cand.healthKey]++;
+                    console.warn('[FlightRadar] source failed:',
+                                 cand.healthKey, err.message);
                 }
+            }
 
+            try {
                 if (models) {
                     activeSource = models.length ? models[0].source : plan.primary.source;
                     applyFixes(models);
