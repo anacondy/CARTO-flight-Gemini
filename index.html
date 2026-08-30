@@ -9,14 +9,19 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black">
 
     <!-- Content Security Policy — restrict to only what the page needs.
-         [CHANGED 2026-08-30] connect-src now also allows https://api.adsb.lol (secondary
-         live ADS-B source used when zoomed in / when OpenSky is rate-limited). -->
+         [CHANGED 2026-08-30] connect-src also allows https://api.adsb.lol (secondary
+         live ADS-B source) and img-src allows tile.openstreetmap.org (basemap
+         fallback when the CARTO CDN is unreachable).
+         [CHANGED 2026-08-30 — incident #2] unpkg.com removed entirely: Leaflet is
+         now self-hosted under vendor/leaflet/, so no third-party code origin is
+         needed. This removes the "map does not load at all" failure mode where a
+         browser/network cannot reach unpkg.com (reported on some ISPs). -->
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'none';
-                   style-src 'self' 'unsafe-inline' https://unpkg.com;
-                   script-src 'self' 'unsafe-inline' https://unpkg.com;
+                   style-src 'self' 'unsafe-inline';
+                   script-src 'self' 'unsafe-inline';
                    connect-src https://opensky-network.org https://api.adsb.lol;
-                   img-src data: https://*.basemaps.cartocdn.com https://*.cartocdn.com;
+                   img-src data: https://*.basemaps.cartocdn.com https://*.cartocdn.com https://tile.openstreetmap.org;
                    font-src 'none';
                    frame-src 'none';
                    base-uri 'self';
@@ -29,9 +34,10 @@
 
     <title>Live Flight Radar — CARTO</title>
 
-    <!-- Leaflet CSS with SRI integrity check -->
+    <!-- Leaflet CSS — self-hosted from the official npm leaflet@1.9.4 tarball
+         (SRI hash computed from the vendored file; see vendor/leaflet/LICENSE) -->
     <link rel="stylesheet"
-          href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+          href="vendor/leaflet/leaflet.css"
           integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
           crossorigin="anonymous" />
 
@@ -210,6 +216,13 @@
             display: none !important;
         }
 
+        /* [ADDED 2026-08-30 — incident #2] Dark-mode tint for the OpenStreetMap
+           basemap fallback, so the map stays visually dark when the CARTO CDN
+           is unreachable. Applied per-tile-image (uniform filter, no seams). */
+        .osm-dark-filter {
+            filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.85);
+        }
+
         /* ─── Dark-mode Leaflet Controls ─────────────────────── */
         .leaflet-control-zoom a {
             background-color: rgba(20, 20, 20, 0.9) !important;
@@ -271,13 +284,26 @@
         <p class="subtitle" id="status">Establishing radar connection…</p>
     </div>
 
-    <!-- Leaflet JS with SRI integrity check -->
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV/XN2GqNg="
+    <!-- Leaflet JS — self-hosted from the official npm leaflet@1.9.4 tarball
+         [CHANGED 2026-08-30 — incident #2] was loaded from unpkg.com; when that CDN
+         is unreachable the whole map silently vanished (black page). Now same-origin. -->
+    <script src="vendor/leaflet/leaflet.js"
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
             crossorigin="anonymous"></script>
 
     <script>
         'use strict';
+
+        // ── Boot guard ─────────────────────────────────────────────────────────
+        // [ADDED 2026-08-30 — incident #2] if the map engine itself fails to load
+        // (missing/corrupted vendored file, extension blocking), say so loudly in
+        // the HUD instead of leaving a silent black page that looks "broken".
+        if (typeof L === 'undefined') {
+            const el = document.getElementById('status');
+            el.textContent = 'Map engine failed to load (vendor/leaflet). Run /diag.html';
+            el.style.color = '#ff4444';
+            throw new Error('Leaflet failed to load — radar cannot start');
+        }
 
         /* ═══════════════════════════════════════════════════════════════════════
            LIVE FLIGHT RADAR — data engine v2 (rewritten 2026-08-30)
@@ -509,7 +535,7 @@
 
         L.control.zoom({ position: 'bottomright' }).addTo(map);
 
-        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        const darkTileLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
             // [CHANGED 2026-08-30] attribution credits both live data sources
             attribution: '&copy; <a href="https://carto.com/" rel="noopener noreferrer">CARTO</a> &middot; data: <a href="https://opensky-network.org" rel="noopener noreferrer">OpenSky Network</a> &amp; <a href="https://adsb.lol" rel="noopener noreferrer">adsb.lol</a>',
             subdomains: 'abcd',
@@ -519,6 +545,37 @@
             updateWhenIdle: false,
             updateWhenZooming: false
         }).addTo(map);
+
+        // ── Basemap resilience ────────────────────────────────────────────────
+        // [ADDED 2026-08-30 — incident #2] if the CARTO CDN is unreachable from
+        // the user's network, every tile errors and the map appears "not loading
+        // at all". After repeated tile errors with ZERO successes, swap to
+        // OpenStreetMap tiles tinted dark via CSS (keeps the visual style) so the
+        // radar keeps working anywhere. Partial errors (a few missing tiles at
+        // extreme zoom) are normal and never trigger the switch.
+        let tileErrors = 0, tileSuccesses = 0, tileWindowStart = Date.now();
+        let usingFallbackTiles = false;
+
+        function switchToFallbackTiles() {
+            if (usingFallbackTiles) return;
+            usingFallbackTiles = true;
+            map.removeLayer(darkTileLayer);
+            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19,
+                className: 'osm-dark-filter',
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" rel="noopener noreferrer">OpenStreetMap</a> contributors &middot; data: <a href="https://opensky-network.org" rel="noopener noreferrer">OpenSky Network</a> &amp; <a href="https://adsb.lol" rel="noopener noreferrer">adsb.lol</a>'
+            }).addTo(map);
+            statusEl.textContent = 'Dark basemap unreachable — using OSM fallback';
+            statusEl.style.color = '#ffaa00';
+        }
+
+        darkTileLayer.on('tileload', () => { tileSuccesses++; });
+        darkTileLayer.on('tileerror', () => {
+            if (usingFallbackTiles || tileSuccesses > 0) return;
+            const now = Date.now();
+            if (now - tileWindowStart > 15000) { tileWindowStart = now; tileErrors = 0; }
+            if (++tileErrors >= 5) switchToFallbackTiles();
+        });
 
         // ── Runtime state ──────────────────────────────────────────────────────
         const statusEl = document.getElementById('status');
