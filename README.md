@@ -25,7 +25,7 @@ Inspired by high-contrast, dark-mode data visualizations, this radar features a 
 ## ✨ Features
 
 - **Real-Time Triple-Source Tracking:** Live state vectors from three independent community ADS-B networks, tried in fan-out order (adsb.fi → adsb.lol → OpenSky). Zoomed-in views refresh every **12 seconds**; wider views use OpenSky with credit-budgeted viewport queries. If your network blocks one source, the next one serves you automatically.
-- **Automatic Failover:** Per-endpoint health tracking with automatic benching — the radar keeps working when a source is rate-limited, CORS-blocked, or down.
+- **Automatic Failover + CORS-Relay Tier:** Per-route health tracking with automatic benching. If the flight APIs are reachable but CORS-blocked (common — they send no CORS headers), the same data is automatically retried through read-only CORS relays, and the winning route is remembered.
 - **Dead-Reckoning Interpolation:** Between API fixes, every aircraft is advanced along its true track at its reported ground speed — planes **glide continuously** instead of teleporting on every poll.
 - **Dark, Watermark-Free Aesthetic:** Default basemap is Esri's key-free **World Dark Gray** canvas. (CARTO raster tiles now carry an *"API key required"* watermark for keyless use — set the free `CONFIG.CARTO_KEY` in `index.html` to restore the original Dark Matter look.)
 - **Smart Viewport Rendering:** Data is fetched **for the area you're looking at**, and HTML markers are only created for aircraft currently visible within your screen bounds (viewport culling), with a marker cap at world zoom to keep things smooth on phones.
@@ -108,7 +108,29 @@ The app is engineered around that budget:
 - No key, no credits, ~1 req/s etiquette — the app polls every 12 s.
 - Tried **in fan-out order** whenever the view radius is ≤ 250 nm (i.e. whenever you're actually looking at a region), and as fallbacks when zoomed out.
 - Adds airframe details (registration, aircraft type/description) to the popup.
-- If one community API is unreachable or CORS-blocked on your network, the engine automatically tries the next one, then OpenSky — see [`diag.html`](diag.html) to check which endpoints your browser can reach.
+
+### CORS reality & the relay tier
+
+None of the three flight APIs send `Access-Control-Allow-Origin`, so browsers cannot read them
+directly from a webpage (they work fine server-side). The engine handles this automatically:
+
+1. Try each API **directly** (works when a network/extension path allows it).
+2. Retry the same query through read-only **CORS relays** (corsproxy.io → allorigins → codetabs)
+   — only small payloads, health-tracked, with the winning route remembered.
+3. For a **production** deployment, deploy your own relay in 2 minutes with
+   [`extras/cloudflare-worker.js`](extras/cloudflare-worker.js) (free tier, allow-listed to the
+   three APIs) and set `CONFIG.PROXY_BASE` in `index.html`.
+
+### Data characteristics
+
+- **What you see:** every aircraft broadcasting ADS-B with a position — passenger airliners,
+  cargo, business jets, general aviation, helicopters, some military. Grounded aircraft are
+  filtered out.
+- **Latency:** typically **< 15 s** behind reality when zoomed in (12 s polling + per-second
+  dead-reckoning interpolation); up to ~2.5 min on zoomed-out OpenSky views (credit budget).
+- **Coverage & reliability:** three independent community networks; coverage follows volunteer
+  receivers — dense over Europe, North America and India, sparser over oceans and remote regions.
+  No SLA — community infrastructure, used with automatic failover.
 
 ---
 

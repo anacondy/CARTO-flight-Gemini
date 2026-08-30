@@ -351,6 +351,46 @@ RECONNECTING"* in the HUD (no flights), and a diag run showing checks **1, 5, 6 
 
 ---
 
+---
+
+## 12. Addendum — 2026-08-30 (night): incident #4 — all three APIs are CORS-blocked; relay tier added
+
+**Owner's diag v2 run (8 checks):** tiles all ✔ (Esri, OSM, CARTO), map engine ✔ — but **all
+three flight APIs failed with "reachable but CORS-blocked (no Access-Control-Allow-Origin)"**.
+The no-cors probes succeeded in 435–696 ms, proving DNS/TCP/TLS/HTTP all work from the owner's
+network — the APIs simply never send the CORS header browsers require, so **no webpage on any
+origin can read these APIs directly**. This also means the *production* GitHub Pages site would
+face the same wall.
+
+### What was done
+
+| # | Fix | Detail |
+|---|---|---|
+| 1 | **CORS-relay tier in the fetch chain** | After every direct route fails, the same query is retried through each read-only public relay in order: `corsproxy.io` → `allorigins` → `codetabs` (relays re-serve payloads with `Access-Control-Allow-Origin: *`). corsproxy.io confirmed to send `Access-Control-Allow-Origin: *` during this session (it 401'd the audit sandbox's datacenter IP; from residential IPs it generally serves). |
+| 2 | **Sticky winning route** | The successful source+relay combination is remembered (`bestRoute`) and retried FIRST on the next poll — zero wasted probing once a route works. |
+| 3 | **Per-relay health tracking** | `proxyFails[]` benches a relay after 3 consecutive failures, exactly like sources. |
+| 4 | **Payload guard** | Only community point queries (~10–100 KB) and small OpenSky boxes (≤2 credits) go through relays — never multi-megabyte world queries. |
+| 5 | **Self-hostable relay** | `extras/cloudflare-worker.js`: a 2-minute, free-tier (100k req/day) Cloudflare Worker, allow-listed to the three APIs, with a 5 s micro-cache. Set `CONFIG.PROXY_BASE` + add its host to CSP. Recommended for the production site. |
+| 6 | **diag v3** | Now 11 checks: rows 9–11 fetch the SAME live data through each relay from the owner's browser — a passing relay row = flights on the map. |
+| 7 | **Honest HUD** | When data arrives via a relay the status line says `“· via CORS relay”`. |
+| 8 | **Tests 93 → 101** | Relay URL encoding, templates, PROXY_BASE override, health+sticky-route logic, small-box guard, worker file + allow-list, diag relay rows. |
+
+### Data characteristics (answers to the owner's questions)
+
+- **Which aircraft appear?** Everything broadcasting ADS-B Out with position: passenger airliners,
+  cargo, business jets, GA aircraft, helicopters, some military/government traffic — not
+  passenger-only. Filtered out: aircraft on the ground and those without a position fix.
+- **Delay:** community feeds are ~1 s fresh at source; the app polls every 12 s zoomed-in and
+  dead-reckons every second between fixes, so displayed positions are typically **<15 s** behind
+  reality (straight-line interpolation; turning aircraft deviate a few km at most). Zoomed-out
+  OpenSky views poll every 90–150 s (credit budget) so they lag up to ~2.5 min.
+- **Reliability:** three independent community networks with per-route health tracking and
+  automatic failover. Coverage follows volunteer receivers — dense over Europe/North America/
+  India, sparser over oceans and parts of Africa/central Asia. No SLA; public relays (when
+  needed) are best-effort — the self-hosted Worker removes that variable.
+
+---
+
 ## Appendix — CI workflow file (commit manually)
 
 ```yaml
