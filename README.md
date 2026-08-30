@@ -2,9 +2,11 @@
 
 ### 🔴 [**View Live Site → anacondy.github.io/CARTO-flight-Gemini**](https://anacondy.github.io/CARTO-flight-Gemini)
 
-A sleek, high-performance, real-time global flight tracker built with **Vanilla JavaScript**, **Leaflet.js**, and the **OpenSky Network API**.
+A sleek, high-performance, real-time global flight tracker built with **Vanilla JavaScript**, **Leaflet.js**, and **two independent live ADS-B data sources** (the [OpenSky Network](https://opensky-network.org/) and [adsb.lol](https://adsb.lol)).
 
-Inspired by high-contrast, dark-mode data visualizations, this radar features a beautiful "Dark Matter" aesthetic with glowing aircraft markers, smooth animations, and dynamic scaling to ensure optimal performance and readability at any zoom level.
+Inspired by high-contrast, dark-mode data visualizations, this radar features a beautiful "Dark Matter" aesthetic with glowing aircraft markers, smooth animations, and viewport-scoped data fetching for optimal performance and readability at any zoom level.
+
+> 📋 **See [REPORT.md](REPORT.md) for the full project audit (2026-08-30)** — live source verification, every bug found & fixed, and the data methodology.
 
 ---
 
@@ -22,18 +24,18 @@ Inspired by high-contrast, dark-mode data visualizations, this radar features a 
 
 ## ✨ Features
 
-- **Real-Time Global Tracking:** Fetches live state vectors for thousands of airborne aircraft globally every 15 seconds.
+- **Real-Time Dual-Source Tracking:** Live state vectors from two independent community ADS-B networks. Zoomed-in views refresh every **12 seconds** via adsb.lol; wider views use OpenSky with credit-budgeted viewport queries.
+- **Automatic Failover:** If one source is rate-limited, blocked, or down, the radar automatically falls back to the other (with runtime health tracking).
+- **Dead-Reckoning Interpolation:** Between API fixes, every aircraft is advanced along its true track at its reported ground speed — planes **glide continuously** instead of teleporting on every poll.
 - **Dark Matter Aesthetic:** Utilizes the CARTO Dark Matter basemap for a modern, sleek, and distraction-free experience.
-- **Dynamic Zoom Scaling:** Airplane icons dynamically resize based on the camera zoom level. This prevents visual clutter ("whiteouts") when zoomed out to a global view, while maintaining crisp detail when zoomed in.
-- **Smart Viewport Rendering:** To ensure a lag-free 60 FPS experience, the map only renders HTML markers for airplanes currently visible within your screen bounds (viewport culling).
-- **Smooth CSS Animations:** Planes smoothly glide across the map and rotate to their true headings using hardware-accelerated CSS transitions.
+- **Smart Viewport Rendering:** Data is fetched **for the area you're looking at**, and HTML markers are only created for aircraft currently visible within your screen bounds (viewport culling), with a marker cap at world zoom to keep things smooth on phones.
 - **Interactive Tooltips & Popups:**
   - Zoom in (level 7+) to reveal permanent text callsigns floating above the aircraft.
-  - Click any aircraft to see real-time telemetry: Origin Country, Altitude, Speed (km/h), and Heading.
-- **Rate-Limit Handling:** Gracefully handles API congestion with a "Holding Pattern" UI state if the OpenSky API rate limits are temporarily reached.
+  - Click any aircraft for live telemetry: origin country *or* registration & aircraft type, altitude, speed (km/h), and heading — refreshed on every data fix.
+- **Rate-Limit Handling:** Credit-aware polling intervals, exponential back-off, no overlapping requests, and polling paused in background tabs. A "Holding Pattern" state appears if OpenSky's anonymous quota is temporarily exhausted.
 - **Fully Responsive:** Works seamlessly on all screen sizes — desktop, tablet, and mobile — with safe-area insets for notched devices.
-- **High Refresh Rate Ready:** Uses `requestAnimationFrame`-driven rendering and GPU-composited CSS transitions for stutter-free animations at 120 Hz+.
-- **Security Hardened:** Content Security Policy, Subresource Integrity (SRI) on all CDN assets, HTML escaping of all API data, and X-Content-Type-Options headers.
+- **Security Hardened:** Content Security Policy, Subresource Integrity (SRI) on all CDN assets, and HTML escaping of **all** API data.
+- **Zero Build Tools:** One HTML file. Open it and it works.
 
 ---
 
@@ -46,7 +48,8 @@ This project is incredibly lightweight and requires **zero build tools**.
 | Frontend | HTML5, CSS3, Vanilla JavaScript (ES6+) |
 | Mapping Engine | [Leaflet.js](https://leafletjs.com/) v1.9.4 |
 | Basemap | [CARTO Dark Matter](https://carto.com/basemaps/) |
-| Live Data | [OpenSky Network API](https://opensky-network.org/apidoc/) |
+| Live Data | [OpenSky Network API](https://opensky-network.org/apidoc/) + [adsb.lol API](https://api.adsb.lol/docs) |
+| Tests | Node.js (`node test/app.test.mjs` — no dependencies) |
 | Hosting | GitHub Pages (auto-deployed via GitHub Actions) |
 
 ---
@@ -68,15 +71,39 @@ Simply double-click `index.html` to open it in your default web browser.
 
 *(Alternatively, use an extension like [VSCode Live Server](https://marketplace.visualstudio.com/items?itemName=ritwickdey.LiveServer) for hot-reloading.)*
 
+**3. (Optional) Run the test suite:**
+
+```bash
+node test/app.test.mjs   # 69 assertions: dead-reckoning maths, source normalisation,
+                         # credit budgeting, wiring & security checks
+```
+
 ---
 
 ## 📡 API & Data Usage
 
-This project is powered by the [OpenSky Network](https://opensky-network.org/api/states/all), a non-profit association providing open access to actual ADS-B flight tracking data.
+This project is powered by two free, community-run ADS-B aggregators providing open access to real flight tracking data.
 
-### Note on Rate Limits
+### OpenSky Network ([/api/states/all](https://opensky-network.org/apidoc/))
 
-The OpenSky API allows unauthenticated users to pull data every 10 seconds. This application is configured to poll every **15 seconds** to provide a safety buffer. If you refresh the page frequently, you may encounter an HTTP `429 (Too Many Requests)` error. The app will display a yellow **"Radar congested"** message and will automatically resume tracking once the limit resets.
+> ⚠️ **2026 status:** basic authentication was removed in March 2026 (OAuth2 client credentials
+> replace it). **Anonymous** access still works but is limited to **400 credits/day** per user,
+> where a `/states/all` request costs **1–4 credits depending on bounding-box area**
+> (≤25 sq° = 1 … global = 4).
+
+The app is engineered around that budget:
+
+- Requests are **scoped to your viewport** (a city-scale box costs 1 credit, not 4).
+- Poll intervals adapt to the cost (90 s for regional boxes, 150 s for world views).
+- HTTP 429 triggers exponential back-off (×2 up to ×8), and polling pauses in hidden tabs.
+- With dead reckoning filling the gaps, the radar still animates smoothly between fixes.
+
+### adsb.lol ([/v2/lat/…/lon/…/dist/…](https://api.adsb.lol/docs))
+
+- No key, no credits, ~1 req/s etiquette — the app polls every 12 s.
+- Used automatically whenever the view radius is ≤ 250 nm (i.e. whenever you're actually
+  looking at a region), and as the fallback source when zoomed out.
+- Adds airframe details (registration, aircraft type) to the popup.
 
 ---
 
@@ -86,17 +113,19 @@ The OpenSky API allows unauthenticated users to pull data every 10 seconds. This
 ┌─────────────────────────────────────────────────────────────────┐
 │                         Browser (Client)                        │
 │                                                                 │
-│  ┌──────────────┐     fetch every 15s      ┌─────────────────┐ │
-│  │  index.html  │ ──────────────────────► │  OpenSky API    │ │
-│  │  + Leaflet   │ ◄────────────────────── │  (states/all)   │ │
-│  └──────────────┘    JSON: ~8,000 flights  └─────────────────┘ │
-│         │                                                       │
-│         ▼  renderPlanes()                                       │
-│  ┌────────────────────────────────────────────────────────────┐ │
-│  │  Viewport Culling → Only markers in view bounds rendered   │ │
-│  │  CSS transitions  → GPU-composited smooth plane movement   │ │
-│  │  rAF debounce     → Zero-jank pan/zoom re-renders          │ │
-│  └────────────────────────────────────────────────────────────┘ │
+│  planQuery(): pick source from current view radius              │
+│   ├─ ≤ 250 nm ──► adsb.lol point query        (12 s refresh)    │
+│  └─ wider ──────► OpenSky viewport bbox query (90–150 s,        │
+│                   1–4 credits by area)          credit-budgeted)│
+│         │            (either falls back to the other on failure)│
+│         ▼                                                       │
+│  normalize → unified aircraft model {lat, lon, track, vel, alt} │
+│         ▼                                                       │
+│  Dead reckoning (1 s tick): advance each aircraft along its     │
+│  track at its ground speed → CSS-transition glide, no teleports │
+│         ▼                                                       │
+│  Viewport culling → only markers in view bounds are rendered    │
+│  Popups & labels refreshed on every fix                         │
 │         │                                                       │
 │         ▼                                                       │
 │  ┌──────────────────────┐    ┌───────────────────────────────┐ │
@@ -106,14 +135,12 @@ The OpenSky API allows unauthenticated users to pull data every 10 seconds. This
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-1. **On page load**, `fetchFlightData()` is called immediately and then on a 15-second interval via `setInterval`.
-2. The OpenSky API returns a JSON object with a `states` array — each entry is a flight's state vector (position, speed, heading, altitude, callsign, etc.).
-3. Flights without a valid lat/lon, or that are on the ground (`state[8] === true`), are filtered out.
-4. `renderPlanes()` iterates the filtered list and **creates, updates, or removes** Leaflet `DivIcon` markers:
-   - **Create:** If a flight ID is new and within the viewport, a new marker is added.
-   - **Update:** If a marker already exists, its `LatLng` is updated (Leaflet animates this via CSS `transform`), and the rotation is updated.
-   - **Remove:** Any marker no longer in the dataset or viewport is removed.
-5. All popup content from the API is **HTML-escaped** before rendering to prevent XSS.
+1. **On page load**, `refresh()` runs immediately, then **self-schedules** the next poll based on which source served the view (no `setInterval`, so requests can never overlap).
+2. Each source's payload is normalized into one internal aircraft model (position, true track, ground speed, altitude, callsign, fix age).
+3. Flights without a valid lat/lon or on the ground are filtered out.
+4. `syncMarkers()` **creates, updates, or removes** Leaflet `DivIcon` markers for the current viewport only.
+5. A 1-second `tick()` **dead-reckons** every rendered aircraft from its last fix to *now*; a matching CSS `transform` transition makes the movement continuous. Extrapolation is capped (2–5 min) so silent aircraft freeze rather than drift forever.
+6. All popup/tooltip content from the APIs is **HTML-escaped** before rendering to prevent XSS.
 
 ---
 
@@ -121,12 +148,15 @@ The OpenSky API allows unauthenticated users to pull data every 10 seconds. This
 
 | Measure | Details |
 |---|---|
-| **Content Security Policy** | `<meta>` CSP restricts all resource origins to only what's needed |
+| **Content Security Policy** | `<meta>` CSP restricts all resource origins to only what's needed (Leaflet CDN + both data APIs) |
 | **Subresource Integrity (SRI)** | SHA-256 integrity hashes on all CDN `<link>` and `<script>` tags |
-| **HTML Escaping** | All API data (callsign, country) is escaped before rendering into popups |
-| **Referrer Policy** | `strict-origin-when-cross-origin` |
-| **Permissions Policy** | Camera, microphone, and geolocation access disabled |
-| **No eval / inline data URIs** | All logic is in-line but isolated; no dynamic `eval` usage |
+| **HTML Escaping** | All API data (callsign, country, registration, type) is escaped before rendering into popups and labels |
+| **Referrer Policy** | `strict-origin-when-cross-origin` (valid via meta) |
+| **No eval / no frames / no forms** | `default-src 'none'`; logic is plain inline JS |
+
+> ℹ️ `X-Content-Type-Options` and `Permissions-Policy` are HTTP-response headers that browsers
+> ignore when set via `<meta>`; they remain in the HTML as documentation of intent for a future
+> host that can set real headers (GitHub Pages cannot).
 
 ---
 
