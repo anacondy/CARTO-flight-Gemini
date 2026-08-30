@@ -34,7 +34,8 @@ Inspired by high-contrast, dark-mode data visualizations, this radar features a 
   - Click any aircraft for live telemetry: origin country *or* registration & aircraft type, altitude, speed (km/h), and heading — refreshed on every data fix.
 - **Rate-Limit Handling:** Credit-aware polling intervals, exponential back-off, no overlapping requests, and polling paused in background tabs. A "Holding Pattern" state appears if OpenSky's anonymous quota is temporarily exhausted.
 - **Fully Responsive:** Works seamlessly on all screen sizes — desktop, tablet, and mobile — with safe-area insets for notched devices.
-- **Security Hardened:** Content Security Policy, Subresource Integrity (SRI) on all CDN assets, and HTML escaping of **all** API data.
+- **CDN-Outage Proof:** Leaflet is self-hosted (no unpkg/jsdelivr dependency) and the basemap automatically falls back to a dark-tinted OpenStreetMap layer if CARTO tiles are unreachable. If anything is still blocked on your network, [`diag.html`](diag.html) pinpoints it in seconds.
+- **Security Hardened:** Content Security Policy, Subresource Integrity (SRI) on all vendored assets, and HTML escaping of **all** API data.
 - **Zero Build Tools:** One HTML file. Open it and it works.
 
 ---
@@ -46,8 +47,8 @@ This project is incredibly lightweight and requires **zero build tools**.
 | Layer | Technology |
 |---|---|
 | Frontend | HTML5, CSS3, Vanilla JavaScript (ES6+) |
-| Mapping Engine | [Leaflet.js](https://leafletjs.com/) v1.9.4 |
-| Basemap | [CARTO Dark Matter](https://carto.com/basemaps/) |
+| Mapping Engine | [Leaflet.js](https://leafletjs.com/) v1.9.4 — **self-hosted** under `vendor/leaflet/` (no CDN) |
+| Basemap | [CARTO Dark Matter](https://carto.com/basemaps/) with automatic dark-tinted [OpenStreetMap](https://www.openstreetmap.org) fallback |
 | Live Data | [OpenSky Network API](https://opensky-network.org/apidoc/) + [adsb.lol API](https://api.adsb.lol/docs) |
 | Tests | Node.js (`node test/app.test.mjs` — no dependencies) |
 | Hosting | GitHub Pages (auto-deployed via GitHub Actions) |
@@ -74,9 +75,13 @@ Simply double-click `index.html` to open it in your default web browser.
 **3. (Optional) Run the test suite:**
 
 ```bash
-node test/app.test.mjs   # 69 assertions: dead-reckoning maths, source normalisation,
-                         # credit budgeting, wiring & security checks
+node test/app.test.mjs   # 79 assertions: dead-reckoning maths, source normalisation,
+                         # credit budgeting, vendored-asset integrity, wiring & security
 ```
+
+> 🩺 **Map or data not appearing?** Open [`diag.html`](diag.html) — it checks every dependency
+> the radar needs (map engine, both basemap hosts, both live data APIs) from your own browser
+> and shows exactly which one is blocked on your network.
 
 ---
 
@@ -148,8 +153,8 @@ The app is engineered around that budget:
 
 | Measure | Details |
 |---|---|
-| **Content Security Policy** | `<meta>` CSP restricts all resource origins to only what's needed (Leaflet CDN + both data APIs) |
-| **Subresource Integrity (SRI)** | SHA-256 integrity hashes on all CDN `<link>` and `<script>` tags |
+| **No third-party code** | Leaflet is self-hosted under `vendor/leaflet/` — nothing loads from a code CDN; SRI hashes (verified by the test suite) protect the vendored files |
+| **Content Security Policy** | `<meta>` CSP restricts all resource origins to only what's needed (self + the two data APIs + the two tile hosts) |
 | **HTML Escaping** | All API data (callsign, country, registration, type) is escaped before rendering into popups and labels |
 | **Referrer Policy** | `strict-origin-when-cross-origin` (valid via meta) |
 | **No eval / no frames / no forms** | `default-src 'none'`; logic is plain inline JS |

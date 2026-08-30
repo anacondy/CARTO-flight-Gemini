@@ -270,6 +270,47 @@ flight trails; altitude-based marker colouring; airport labels layer.
 
 ---
 
+## 10. Addendum — 2026-08-30 (later the same day): “map does not load at all” incident
+
+**Reported by the owner after the v2 engine shipped:** the map itself was not loading — not even
+the basemap (flight data aside). A screenshot was supplied but could not be inspected during this
+session (no vision available), so the issue was diagnosed from evidence instead.
+
+### Evidence gathering
+
+- The local preview server's access log shows the page **was served successfully to the user's
+  browser** (`GET / 200` at 17:24). So hosting, HTML, and the preview proxy were all fine — the
+  failure happened **inside the browser, at the page's external dependencies**.
+- At page load the app had exactly two external hard dependencies, both failing → black map with
+  only the HUD box visible:
+  1. `unpkg.com` — Leaflet JS + CSS (if this fails: `L is not defined`, nothing renders at all)
+  2. `*.basemaps.cartocdn.com` — the dark basemap tiles (if this fails: black map, zoom buttons visible)
+- CDN-level blocks/outages affecting unpkg or cartocdn are well documented on various networks
+  (ISP filters, DNS issues, unpkg global outages). The owner's report that this *also* happened
+  with the original deployed site is consistent: both versions shared the same two dependencies.
+
+### Fixes applied (all verified by the test suite — now 79 assertions)
+
+| # | Fix | Detail |
+|---|---|---|
+| 1 | **Leaflet is now self-hosted** | The official `leaflet@1.9.4` npm tarball is vendored under `vendor/leaflet/` (JS + CSS + marker images + BSD LICENSE). No third-party code origin is needed at page load; the unpkg dependency — and its whole failure class — is gone. The vendored `leaflet.css` is byte-identical to the CDN build (SRI-proven); `leaflet.js` is the official npm dist build with a freshly computed SRI hash. |
+| 2 | **CSP tightened** | `unpkg.com` removed from `script-src`/`style-src`; only `'self'` serves code now. `img-src` additionally allows `tile.openstreetmap.org` for the new basemap fallback. |
+| 3 | **Basemap fallback chain** | If CARTO tiles error ≥5 times with **zero** successes (i.e. the CDN is unreachable, not just a missing tile), the app switches to OpenStreetMap tiles tinted dark via CSS (`.osm-dark-filter`: invert + hue-rotate), keeping the visual style. Partial errors never trigger the switch. |
+| 4 | **Boot guard** | If the map engine itself ever fails to load, the HUD now shows a clear red error (with a pointer to `diag.html`) instead of a silent black page. |
+| 5 | **`diag.html` — connectivity self-test** | A dependency-free diagnostics page that checks, from the user's own browser: vendored Leaflet, unpkg (old dependency), a CARTO tile, an OSM tile, the OpenSky API, and the adsb.lol API — each with pass/fail and timing. Whatever row shows ✘ is what that network is blocking. |
+| 6 | **Tests extended 69 → 79** | New assertions: vendored files exist; SRI hash in the HTML matches the actual vendored file; zero unpkg references remain; boot guard present; tile-fallback wiring present; CSP allows both basemap hosts. |
+
+### Outcome
+
+- If **unpkg** was the blocked origin (most likely, given “no map at all”): **fixed** — Leaflet now
+  loads from the same origin as the page.
+- If **CARTO tiles** are also blocked: **mitigated** — automatic dark-tinted OSM fallback keeps a
+  usable map; the primary path is unchanged when CARTO is reachable.
+- If a network blocks *everything* external (both tile hosts and both data APIs), no client-side
+  code can compensate — `diag.html` will prove it in seconds, which is the honest outcome.
+
+---
+
 ## Appendix — CI workflow file (commit manually)
 
 ```yaml
